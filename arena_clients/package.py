@@ -577,6 +577,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Archive: {archive}")
         print(f"SHA-256: {checksum.read_text(encoding='utf-8').split()[0]}")
         print(f"Checksum file: {checksum}")
+        print(
+            "Publish these two files to a new public GitHub repository "
+            "(see docs/submitting.md)."
+        )
         print(f"Entrypoint: {' '.join(manifest['runtime']['entrypoint'])}")
         print(f"Files: {len(manifest['artifact']['files'])}")
         return 0

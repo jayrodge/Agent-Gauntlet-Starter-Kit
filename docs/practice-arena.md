@@ -172,7 +172,7 @@ python -m arena_clients.package --check dist/gauntlet-submission
 ```
 
 See [Submitting your agent](submitting.md) for the package self-check and
-how to hand off a GitHub repository.
+how to hand off the two packager files on GitHub.
 
 ## Known Limits
 

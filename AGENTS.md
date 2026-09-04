@@ -43,7 +43,7 @@ Practice differences worth knowing:
 - State is in memory and resets when the services restart.
 - Puzzles are synthetic and do not reveal event challenges; the model roster and rate limits can differ from a live event.
 
-See [`docs/practice-arena.md`](docs/practice-arena.md) for the full walkthrough. When the agent is frozen, follow [`docs/submitting.md`](docs/submitting.md) to package and hand off a GitHub repository.
+See [`docs/practice-arena.md`](docs/practice-arena.md) for the full walkthrough. When the agent is frozen, follow [`docs/submitting.md`](docs/submitting.md) to package and hand off the tarball and checksum on GitHub.
 
 ## Required Configuration
 The organizer must provide:
@@ -137,6 +137,7 @@ Before competition or merge:
   - `python -m arena_clients.package --agent-id my-team --agent-name "My Team"`
   - `python -m arena_clients.package --check dist/gauntlet-submission`
   - confirm `dist/gauntlet-submission/submission.json` is present and the tree has no `.env`, keys, caches, extra README/LICENSE/`.gitignore`, symlinks, or a participant Dockerfile
+  - confirm `dist/<agent-id>-submission.tar.gz` and `dist/<agent-id>-submission.tar.gz.sha256` exist
   - see [`docs/submitting.md`](docs/submitting.md)
 
 ## Troubleshooting

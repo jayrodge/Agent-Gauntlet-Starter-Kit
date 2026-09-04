@@ -141,15 +141,16 @@ completes a practice challenge, and the organizer can see the session and result
 
 ## Package and Submit
 
-When the agent is frozen, package it, self-check, then publish a new
-public GitHub repository whose root is `dist/gauntlet-submission/`:
+When the agent is frozen, package it, self-check, then publish the two
+packager files from `dist/` to a new public GitHub repository:
 
 ```bash
 python -m arena_clients.package --agent-id my-team --agent-name "My Team"
 python -m arena_clients.package --check dist/gauntlet-submission
+# push dist/my-team-submission.tar.gz and dist/my-team-submission.tar.gz.sha256
 ```
 
-See [Submitting your agent](docs/submitting.md) for the GitHub-repo
+See [Submitting your agent](docs/submitting.md) for the two-file GitHub
 handoff, the `submission.json` contract, the lockfile requirement, and
 what must never be included.
 

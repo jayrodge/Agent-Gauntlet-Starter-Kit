@@ -100,4 +100,4 @@ and the rest of the failure modes, see the troubleshooting table in
 - [Interacting with Tools](interacting-with-tools.md)
 - [Architecture](architecture.md)
 - [Agent Gauntlet Practice](practice-arena.md)
-- [Submitting your agent](submitting.md) — after Practice works, package, self-check, and hand off the archive
+- [Submitting your agent](submitting.md) — after Practice works, package, self-check, and hand off the tarball and checksum on GitHub
