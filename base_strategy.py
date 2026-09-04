@@ -1,4 +1,4 @@
-"""Programmable strategy hooks for Agent Gauntlet starter kit agents.
+"""Programmable strategy hooks for Agent Gauntlet Starter Kit agents.
 
 `BaseStrategy` is framework-agnostic and exposes the same hook surface to
 Python, LangGraph, and CrewAI examples.
@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+
+from model_selector import prefer_image_models as filter_image_models
 
 
 _IMAGE_SIZE_HINT = (
@@ -50,24 +52,50 @@ class BaseStrategy:
         "If you add reasoning, keep it to at most 2 short lines after the ANSWER line. "
         "Never output 'unknown'. "
         "Before submitting, broadcast at least one progress thought via broadcast_thought "
-        "(POST /api/thought); missing broadcasts reduce score."
+        "(POST /api/thought) so spectators can follow your progress."
     )
     text_strategy_notes = "Keep reasoning concise and always include an ANSWER line."
     text_temperature = 0.0
-    text_max_tokens = 320
+    text_max_tokens = 1024
     image_strategy_notes = (
         "Prefer image_edit when an input image is available. Keep rationale concise. "
         "Request standard-resolution output only and avoid HD or 4K images."
     )
-    preferred_model = ""
+
+    @staticmethod
+    def is_image_challenge(ctx: ChallengeContext) -> bool:
+        """True when the running heat is an image challenge."""
+        return "image" in ctx.challenge_type.strip().lower() or bool(ctx.image_url)
+
+    @staticmethod
+    def prefer_image_models(
+        available_models: list[str],
+        *,
+        model_rows: list[dict[str, Any]] | None = None,
+    ) -> list[str]:
+        """Filter to image-capable aliases, preserving relative order.
+
+        Uses ``capabilities: ["image"]`` from the last ``/models`` fetch when
+        present. Falls back to the ``*-image`` suffix when the flag is absent
+        (practice LiteLLM does not carry it).
+        """
+        return filter_image_models(available_models, model_rows=model_rows)
 
     def rank_models(
         self,
         ctx: ChallengeContext,
         available_models: list[str],
     ) -> list[str]:
-        """Return the ranked model list for the current challenge."""
-        _ = ctx
+        """Return the ranked model list for the current challenge.
+
+        Text challenges keep proxy roster order. Image challenges prefer
+        image-capable aliases via ``prefer_image_models``. Override this
+        (or `pick_model`) to implement a real model-selection strategy.
+        """
+        if self.is_image_challenge(ctx):
+            preferred = self.prefer_image_models(available_models)
+            if preferred:
+                return preferred
         return list(available_models)
 
     def pick_model(
@@ -80,10 +108,7 @@ class BaseStrategy:
         _ = stage
         _ = ctx
         if not ranked_models:
-            return "default"
-        preferred = str(self.preferred_model or "").strip()
-        if preferred and preferred in ranked_models:
-            return preferred
+            return ""
         return ranked_models[0]
 
     def build_system_prompt(self, ctx: ChallengeContext) -> str:

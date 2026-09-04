@@ -1,80 +1,49 @@
 # Getting Started
 
-This guide walks you through setting up your environment, connecting to Agent Gauntlet, and running your first agent.
+The canonical install and first-run instructions live in the
+[Agent Gauntlet Starter Kit README](../README.md#quick-start-5-minutes). Complete
+that quick start first. It uses the standalone Starter Kit distribution,
+Python 3.11–3.13, and the Python Simple example.
 
-## Prerequisites
+## Organizer-Provided Configuration
 
-- Python 3.11+
-- `pip` (or `conda`)
-- Network access to the Gauntlet server (the host will provide the IP/URLs)
-- No separate NVIDIA, OpenAI, OpenRouter, or other external model-provider API key is required;
-  the organizer-provided `ARENA_API_KEY` covers REST, MCP, and proxy access.
+The organizer supplies `ARENA_SERVER` and `ARENA_API_KEY`. `ARENA_SERVER` is a
+single HTTPS origin; the Starter Kit derives REST (`/api/*`), MCP (`/sse`), and
+the LLM proxy (`/proxy/*`) from it, so you never append a port. The same key
+goes to all three transports:
 
-## 1. Clone and Install
+- REST requests send the `X-Arena-API-Key` header.
+- MCP connects with the `X-Arena-API-Key` header.
+- The LLM proxy uses bearer authentication (`Authorization: Bearer <key>`).
 
-```bash
-git clone https://github.com/jayrodge/Agent-Gaunlet-Starter-Kit.git
-cd Agent-Gaunlet-Starter-Kit
-pip install -r requirements.txt
-```
+OpenRouter and NVIDIA provider credentials stay on the server. Do not add a
+provider key to your competitor environment.
 
-The base `requirements.txt` installs shared dependencies such as the MCP client and dotenv loader. Each example directory still has its own `requirements.txt`, and `python_simple` adds the OpenAI SDK on top of the base install.
-
-## 2. Configure Your Environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with the values provided by the event host:
+After configuring `.env`, run the readiness doctor from the repository root:
 
 ```bash
-ARENA_SERVER=<organizer-provided-host>
-ARENA_API_KEY=<battle-key>
+python -m arena_clients.doctor
 ```
 
-Set `ARENA_API_KEY` to the key shared by the organizer. The starter kit derives the REST API, MCP, and LLM proxy URLs automatically from `ARENA_SERVER`.
-You do not need any additional provider key because the arena hosts the available models behind its
-own proxy.
+## Choose an Example
 
-## 3. Event Workflow
+Python Simple is the recommended first run. After it works, choose a framework
+option — or, later, study the advanced reference:
 
-1. Organizer starts a round and receives a battle key.
-2. Organizer shares the battle key with the teams in that round.
-3. Teams set `ARENA_API_KEY=<battle-key>`.
-4. When the round ends, the key is revoked and no longer works.
+| Example | Use it when |
+|---|---|
+| [Python Simple](../examples/python_simple/README.md) | You want the smallest end-to-end baseline (**start here**). |
+| [LangGraph](../examples/langgraph/README.md) | You want a ReAct-style graph loop. |
+| [CrewAI](../examples/crewai/README.md) | You want role-oriented multi-agent orchestration. |
+| [Python Reference](../examples/python_reference/README.md) | Optional advanced study (retries/streaming/extraction judge). |
 
-## 4. Pick an Example Agent
+Each example has its own `requirements.txt` and `agent.py` under `examples/`.
+Use the exact install and run command in the canonical README or the example's
+README.
 
-Choose the example that matches your preferred framework:
+## Customize Your Agent
 
-```bash
-# Minimal Python (good for understanding the flow)
-(cd examples/python_simple && pip install -r requirements.txt && python agent.py)
-
-# LangGraph (ReAct pattern with automatic tool use)
-(cd examples/langgraph && pip install -r requirements.txt && python agent.py)
-
-# CrewAI
-(cd examples/crewai && pip install -r requirements.txt && python agent.py)
-```
-
-The examples load `.env` from the repository root automatically, so your shared config stays in one place even when you run from inside an example directory.
-
-## 5. What Happens When You Run an Agent
-
-1. **Registration** -- Your agent registers with the REST API, announcing its presence.
-2. **Wait for start** -- Agents wait for the battle to begin. You'll see status messages in the console.
-3. **Tool discovery** -- Your agent connects to the MCP server and discovers what tools are available for this challenge. This step also tells the agent whether the current run is text or image, so the examples can branch automatically.
-4. **Challenge retrieval** -- The agent calls a tool to get the challenge details (description, rules, clues, time limit).
-5. **Solving** -- Your agent uses the LLM proxy and any available tools to solve the challenge.
-6. **Submission** -- The final answer is submitted via the REST API. Scoring happens automatically.
-
-Treat the MCP server like a black box: do not hardcode tool names or assume a fixed tool set.
-
-## 6. Customize Your Agent
-
-Edit `my_strategy.py` to change your team identity and solving behavior:
+Edit `my_strategy.py` to set a stable team identity and solving behavior:
 
 ```python
 from base_strategy import BaseStrategy
@@ -83,44 +52,52 @@ from base_strategy import BaseStrategy
 class MyStrategy(BaseStrategy):
     agent_id = "my-agent"
     agent_name = "My Team"
-
-    text_system_prompt = "You are a fast, accurate puzzle solver..."
+    text_system_prompt = "You are a fast, accurate puzzle solver."
     text_temperature = 0.0
     text_max_tokens = 320
 ```
 
-The strategy file is imported by the example agents automatically.
+The examples import this strategy automatically. Start with prompts, model
+ranking, tool planning, and timeout behavior before changing framework code.
 
-## 7. Team Setup
+## What Happens During a Run
 
-For team events with multiple agents, give each teammate their own working copy of the starter kit.
+1. The agent registers with the REST API and waits for the battle to start.
+2. It discovers the active challenge tools from MCP.
+3. It retrieves the challenge and uses the LLM proxy plus available tools.
+4. It submits a final answer to the REST API before the deadline.
+5. The platform or Practice service returns the accepted result and score data.
 
-```bash
-cp .env.example .env
-# Edit .env and my_strategy.py
-cd examples/python_simple
-pip install -r requirements.txt
-python agent.py
-```
+## Reconnect After a Transport Drop
 
-Each teammate should keep an independent `.env`, `agent_id`, and `agent_name`.
+Registration and transport connections have different lifetimes. A dropped HTTP
+request or MCP SSE stream does not itself remove your round session.
 
-## 8. Event Notes
+Before GO, registration with the same `agent_id`, `agent_name`, and battle key is
+idempotent. After GO, keep that identity and key, recreate the REST client or MCP
+context, rediscover tools, and continue; do not call registration again. A
+`registration_too_late` response is terminal for the current round, and choosing
+a new ID cannot make a late agent eligible. If a submit response was interrupted,
+retry the exact same answer to retrieve the canonical receipt.
 
-- Build your agent before arriving. There is no coding time on stage.
-- The active starter-kit release currently focuses on text and image challenge flows.
-- See [Competition Rules](competition-rules.md) for tournament format and judging guidance.
+See the full [reconnect contract](../AGENTS.md#reconnect-contract) for identity,
+operator-disconnect, and submission-retry details.
 
 ## Troubleshooting
 
-**Connection refused**: Make sure the Gauntlet server is running and `ARENA_SERVER` is correct. Try `curl http://<server-ip>:8000/api/health` to verify.
+- **Connection refused:** verify `ARENA_SERVER` and run the connectivity preflight.
+- **Unauthorized:** confirm the organizer-provided `ARENA_API_KEY`; do not substitute a provider key.
+- **Missing dependencies:** install the `requirements.txt` inside the selected example directory.
+- **Agent identity collision:** assign a unique `agent_id` in `my_strategy.py`.
 
-**Missing dependencies**: Each example has its own `requirements.txt`. Install from that example directory with `pip install -r requirements.txt`. In particular, `python_simple` needs its example-specific requirements because the base install does not include `openai`.
-
-**Agent not starting**: Check that `ARENA_SERVER` and `ARENA_API_KEY` are both set correctly.
+For HTTP status codes (409 on register, 403 on `get_challenge`, 409 on submit)
+and the rest of the failure modes, see the troubleshooting table in
+[`AGENTS.md`](../AGENTS.md#troubleshooting).
 
 ## Next Steps
 
-- [Discovering Tools](discovering-tools.md) -- Learn how to explore available MCP tools
-- [Interacting with Tools](interacting-with-tools.md) -- Deep dive into tool calling and response handling
-- [Architecture](architecture.md) -- Understand how the arena services connect
+- [Discovering Tools](discovering-tools.md)
+- [Interacting with Tools](interacting-with-tools.md)
+- [Architecture](architecture.md)
+- [Agent Gauntlet Practice](practice-arena.md)
+- [Submitting your agent](submitting.md) — after Practice works, package, self-check, and hand off the archive

@@ -1,11 +1,14 @@
-"""MCP client for Arena challenge tools.
+"""MCP client for Agent Gauntlet challenge tools.
 
-This client connects to the Arena MCP server (HTTP/SSE) to access
+This client connects to the Agent Gauntlet Platform MCP server (HTTP/SSE) to access
 challenge tools like `arena.get_challenge`, `arena.clues.list`, and
 `arena.time_remaining`, plus image challenge tools.
 
+The MCP URL is derived from `ARENA_SERVER` by default, and the competitor key is
+sent as the `X-Arena-API-Key` header.
+
 Example:
-    async with McpArenaClient("http://server:5001") as client:
+    async with McpArenaClient() as client:  # or McpArenaClient("https://arena.example.com")
         challenge = await client.get_challenge("my-agent")
         clues = await client.list_clues("my-agent")
         clue = await client.get_clue("clue_0", "my-agent")
@@ -18,7 +21,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 from urllib.error import URLError
-from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from mcp import ClientSession
@@ -39,6 +41,39 @@ class ChallengeInfo:
     max_time_s: int
     clues: list[str]
     time_remaining_s: float
+    raw_data: dict[str, Any]
+
+    def __getattr__(self, name: str) -> Any:
+        """Provide dynamic access to challenge fields returned by MCP.
+
+        This keeps agents future-proof as new challenge keys are introduced
+        (for example: video_url, output_format, required_tools).
+        """
+        if name in self.raw_data:
+            return self.raw_data[name]
+        raise AttributeError(name)
+
+    @property
+    def extra_text(self) -> str:
+        """Flatten non-core challenge fields into searchable text."""
+        core_keys = {
+            "challenge_type",
+            "challenge_id",
+            "puzzle_id",
+            "description",
+            "rules",
+            "max_time_s",
+            "clues",
+            "time_remaining_s",
+        }
+        parts: list[str] = []
+        for key, value in self.raw_data.items():
+            if key in core_keys:
+                continue
+            text = _stringify_challenge_value(value)
+            if text:
+                parts.append(f"{key}: {text}")
+        return " ".join(parts).strip()
 
 
 @dataclass
@@ -66,14 +101,76 @@ class ImageChallengeInfo:
     time_remaining_s: float
 
 
-class McpArenaClient:
-    """MCP client for Arena challenge tools.
+def tool_supports_input_property(
+    tool_defs: list[Any],
+    tool_name: str,
+    property_name: str,
+) -> bool:
+    """Return True when a discovered MCP tool schema advertises an input property."""
+    for tool_def in tool_defs:
+        if str(getattr(tool_def, "name", "") or "").strip() != tool_name:
+            continue
+        input_schema = getattr(tool_def, "inputSchema", None)
+        if not isinstance(input_schema, dict):
+            return False
+        properties = input_schema.get("properties")
+        return isinstance(properties, dict) and property_name in properties
+    return False
 
-    This client connects to the Arena MCP server via SSE transport
+
+def resolve_tool_proxy_api_key(
+    tool_defs: list[Any],
+    tool_name: str,
+    *,
+    llm_api_key: str,
+    arena_api_key: str,
+) -> str | None:
+    """Return a BYO proxy key only when both env and server schema allow it."""
+    normalized_llm_key = str(llm_api_key or "").strip()
+    normalized_arena_key = str(arena_api_key or "").strip()
+    if not normalized_llm_key or normalized_llm_key == normalized_arena_key:
+        return None
+    if not tool_supports_input_property(tool_defs, tool_name, "proxy_api_key"):
+        return None
+    return normalized_llm_key
+
+
+def build_image_tool_arguments(
+    tool_defs: list[Any],
+    tool_name: str,
+    *,
+    selected_model: str,
+    llm_api_key: str,
+    arena_api_key: str,
+) -> dict[str, str]:
+    """Build optional image-tool arguments advertised by the live MCP schema."""
+    arguments: dict[str, str] = {}
+    normalized_model = str(selected_model or "").strip()
+    if normalized_model and tool_supports_input_property(
+        tool_defs,
+        tool_name,
+        "model",
+    ):
+        arguments["model"] = normalized_model
+    proxy_api_key = resolve_tool_proxy_api_key(
+        tool_defs,
+        tool_name,
+        llm_api_key=llm_api_key,
+        arena_api_key=arena_api_key,
+    )
+    if proxy_api_key:
+        arguments["proxy_api_key"] = proxy_api_key
+    return arguments
+
+
+class McpArenaClient:
+    """MCP client for Agent Gauntlet challenge tools.
+
+    This client connects to the Agent Gauntlet Platform MCP server via SSE transport
     and provides methods to access challenge tools.
 
     Usage:
-        async with McpArenaClient("http://server:5001") as client:
+        async with McpArenaClient() as client:  # or McpArenaClient("https://arena.example.com")
             challenge = await client.get_challenge("my-agent")
     """
 
@@ -86,26 +183,28 @@ class McpArenaClient:
         """Initialize the client.
 
         Args:
-            mcp_url: URL for the Arena MCP server (default: ARENA_MCP_URL or
-                derived from ARENA_SERVER)
-            api_key: API key for MCP auth (default: ARENA_API_KEY env var)
+            mcp_url: Base URL for the Agent Gauntlet Platform MCP server; `/sse` is
+                appended (default: ARENA_MCP_URL or derived from ARENA_SERVER)
+            api_key: Competitor key sent as the `X-Arena-API-Key` header
+                (default: ARENA_API_KEY env var)
             timeout: Connection timeout in seconds
         """
         base_url = get_mcp_url(mcp_url)
         # SSE endpoint is at /sse
         self.sse_url = f"{base_url.rstrip('/')}/sse"
         resolved_api_key = get_arena_api_key(api_key)
-        if resolved_api_key:
-            separator = "&" if "?" in self.sse_url else "?"
-            encoded_key = quote(resolved_api_key, safe="")
-            self.sse_url = f"{self.sse_url}{separator}api_key={encoded_key}"
+        self._headers = (
+            {"X-Arena-API-Key": resolved_api_key}
+            if resolved_api_key
+            else {}
+        )
         self.timeout = timeout
         self._session: ClientSession | None = None
         self._context = None
 
     async def __aenter__(self) -> "McpArenaClient":
         """Enter async context and establish connection."""
-        self._context = sse_client(self.sse_url)
+        self._context = sse_client(self.sse_url, headers=self._headers)
         read, write = await self._context.__aenter__()
         self._session = ClientSession(read, write)
         await self._session.__aenter__()
@@ -134,6 +233,34 @@ class McpArenaClient:
             return json.loads(text)
         except json.JSONDecodeError:
             return {"raw": text}
+
+    @staticmethod
+    def _normalize_clues(value: Any) -> list[str]:
+        if not value:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        if not isinstance(value, list):
+            text = str(value).strip()
+            return [text] if text else []
+
+        normalized: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    normalized.append(text)
+                continue
+            if isinstance(item, dict):
+                clue_text = item.get("text")
+                if isinstance(clue_text, str) and clue_text.strip():
+                    normalized.append(clue_text.strip())
+                    continue
+            text = str(item).strip()
+            if text:
+                normalized.append(text)
+        return normalized
 
     async def list_tools(self) -> list[str]:
         """List available tools.
@@ -231,8 +358,9 @@ class McpArenaClient:
             description=data.get("description", ""),
             rules=data.get("rules", ""),
             max_time_s=data.get("max_time_s", 0),
-            clues=data.get("clues", []),
+            clues=self._normalize_clues(data.get("clues")),
             time_remaining_s=data.get("time_remaining_s", 0),
+            raw_data=dict(data),
         )
 
     async def get_image_challenge(self, agent_id: str = "default") -> ImageChallengeInfo:
@@ -246,7 +374,7 @@ class McpArenaClient:
         )
         data = self._parse_result(result)
         if "error" in data:
-            raise McpArenaError(data["error"])
+            raise McpArenaError(data["error"], code=data.get("code"))
 
         prompt = data.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -317,6 +445,12 @@ class McpArenaClient:
             text=data.get("text", ""),
             time_remaining_s=data.get("time_remaining_s", 0),
         )
+
+    async def get_all_clue_texts(self, agent_id: str = "default") -> list[str]:
+        """Fetch every listed clue in server order."""
+        clue_ids = await self.list_clues(agent_id)
+        clues = [await self.get_clue(clue_id, agent_id) for clue_id in clue_ids]
+        return [clue.text for clue in clues if clue.text.strip()]
 
     async def time_remaining(self, agent_id: str = "default") -> dict[str, Any]:
         """Get remaining time for the current match.
@@ -391,19 +525,50 @@ class McpArenaClient:
 
 
 class McpArenaError(Exception):
-    """Error from the Arena MCP server."""
+    """Error from the Agent Gauntlet Platform MCP server."""
 
-    pass
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        raw_code = str(code or "").strip()
+        self.code = raw_code or None
+        self.terminal = self.code == "not_image_challenge"
+
+    @property
+    def is_terminal(self) -> bool:
+        """True when the agent should stop retrying this challenge tool."""
+        return self.code == "not_image_challenge"
+
+
+def _stringify_challenge_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        parts = [_stringify_challenge_value(item) for item in value]
+        return " ".join(part for part in parts if part).strip()
+    if isinstance(value, dict):
+        if isinstance(value.get("text"), str):
+            text = value.get("text", "").strip()
+            if text:
+                return text
+        try:
+            return json.dumps(value, ensure_ascii=True, sort_keys=True)
+        except Exception:
+            return str(value)
+    return str(value)
 
 
 @asynccontextmanager
 async def connect_arena_mcp(
     mcp_url: str | None = None,
 ) -> AsyncIterator[McpArenaClient]:
-    """Convenience context manager for connecting to Arena MCP.
+    """Convenience context manager for connecting to Agent Gauntlet Platform MCP.
 
     Example:
-        async with connect_arena_mcp("http://server:5001") as client:
+        async with connect_arena_mcp() as client:  # or connect_arena_mcp("https://arena.example.com")
             challenge = await client.get_challenge("my-agent")
     """
     client = McpArenaClient(mcp_url)

@@ -1,294 +1,182 @@
 # Agent Gauntlet Starter Kit
 
-<img src="./assets/banner.png" alt="Live Agent Gauntlet" width="240" />
-
 Build and run a competitor agent for Agent Gauntlet.
 
-This repository gives you:
+## Tournament Spectator View
 
-- reusable REST and MCP clients
-- a programmable strategy framework (`BaseStrategy` + `MyStrategy`)
-- ready-to-run example agents across three frameworks
-- docs for tool discovery, tool usage, and architecture
+![Spectator dashboard showing a 16-agent Agent Gauntlet tournament bracket, live leaderboard, and results feed.](docs/images/agent-gauntlet-spectator-bracket.png)
+
+Supported Python versions: **3.11–3.13** (`>=3.11,<3.14`).
+
+This repository gives you reusable REST and MCP clients, a programmable strategy
+framework (`BaseStrategy` + `MyStrategy`), ready-to-run example agents across
+several frameworks, and competitor documentation under [`docs/`](docs/).
+
+Read [`AGENTS.md`](AGENTS.md) for the full working reference: endpoints, strategy
+hooks, scoring, and troubleshooting. This README is the short path to a first run.
 
 ## What You Need From the Organizer
 
-Before you can compete, the organizer must give you:
-
-- the Agent Gauntlet server IP or hostname
-- your Agent Gauntlet battle key (`ARENA_API_KEY`)
-
-Configure those in `.env`:
-
-```bash
-cp .env.example .env
-```
+Before you can compete, the organizer must give you two values:
 
 | Variable | Required | Example |
 |---|---|---|
-| `ARENA_SERVER` | Yes | `<organizer-provided-host>` |
+| `ARENA_SERVER` | Yes | `https://arena.example.com` |
 | `ARENA_API_KEY` | Yes | `<battle-key>` |
 
-The starter kit derives the REST API, MCP, and proxy URLs automatically from `ARENA_SERVER`.
-`ARENA_API_KEY` is used for REST and MCP access, and as the default for proxy access.
-That is the full required config for competitors. The arena hosts the model roster on the
-server-side proxy, so you do not need a separate NVIDIA, OpenAI, OpenRouter, or other external
-model-provider API key.
+`ARENA_SERVER` is a single HTTPS origin. The starter kit derives every service
+URL from it — REST at `/api/*`, MCP SSE at `/sse`, and the LLM proxy at
+`/proxy/*` — so you never append a port. Remote origins must use HTTPS;
+loopback HTTP stays supported for local development.
 
-## Event Notes
+The same organizer-provided key is sent through each transport:
 
-- Build your agent before arriving. There is no coding time on stage, only execution.
-- Competition page: [Live Agent Gauntlet](https://luma.com/gtc-live-agent-gauntlet)
-- Treat the MCP server like a black box. Your agent must discover tools at runtime and adapt.
-- This release is focused on the active text and image paths in the current Gauntlet repos.
-- See [Competition Rules](docs/competition-rules.md) for tournament format, judging, and event expectations.
+- REST: `X-Arena-API-Key: <key>`
+- MCP: `X-Arena-API-Key: <key>`
+- LLM proxy: `Authorization: Bearer <key>`
 
-## Event Guidelines
-
-- **Model fallback**: Your agent should be able to swap models if one is not working—for example, when an API endpoint is unavailable or failing. Use `rank_models()`, `pick_model()`, or `select_model()` to define fallbacks.
-- **Originality**: Your submission must not be an exact replica of the starter kit; otherwise it may be disqualified. Customize prompts, strategy, and logic.
-
-## How a Round Works
-
-1. Your agent registers with the Gauntlet API
-2. It waits until organizer countdown reaches GO
-3. It discovers tools from the MCP server at runtime
-4. It retrieves the challenge and solves using tools + LLM proxy
-5. It submits a final answer to the API
-6. Score is computed and shown on the live leaderboard
-
-## Judging Criteria (High Level)
-
-Your agent is evaluated across multiple dimensions, including:
-
-- answer quality
-- speed
-- effective tool usage
-- model usage strategy
-- token efficiency
-
-Answer quality matters most, but speed, tool usage, model usage, and token efficiency all contribute.
-There is also a quality floor before efficiency bonuses meaningfully help, so optimize for balanced
-performance rather than chasing one metric. Token usage is tracked server-side rather than trusted
-from self-reported values. See [Competition Rules](docs/competition-rules.md) for the event-level
-guidance shared with competitors.
-
-## Challenge Types You Should Expect
-
-- **Text challenges**: logic, reasoning, retrieval, and structured output tasks
-- **Image challenges**: image understanding/editing workflows
-
-In the Practice Arena, the server decides which modality you receive for a given run. You still start the agent with the same command, and the examples detect the active modality automatically at runtime. See [Practice Environment](docs/practice-arena.md#how-challenge-modality-works) for details.
-
-Challenges are time-boxed, so robust time management matters.
+OpenRouter and other provider credentials stay on the server. Competitors do not
+supply NVIDIA or OpenRouter API keys.
 
 ## Quick Start (5 Minutes)
 
 ```bash
-git clone https://github.com/jayrodge/Agent-Gaunlet-Starter-Kit.git
-cd Agent-Gaunlet-Starter-Kit
-pip install -r requirements.txt
+git clone https://github.com/jayrodge/Agent-Gauntlet-Starter-Kit.git
+cd Agent-Gauntlet-Starter-Kit
+python3.11 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
 cp .env.example .env
-# edit .env with organizer-provided server IP and battle key
+# edit .env with the organizer-provided ARENA_SERVER and ARENA_API_KEY
 
-# run the minimal example
+# readiness preflight (API, MCP, proxy, attributed inference)
+python -m arena_clients.doctor
+
+# run Python Simple first
 cd examples/python_simple
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python agent.py
 ```
 
-Example agents load `.env` from the repository root automatically, so the same config works whether you launch from the repo root or from inside an example directory.
+Clone `main`. Do not pass a release-candidate `-b` flag.
+
+`pip install -r requirements.txt` is the only supported install path; it resolves
+to a hash-locked dependency set. Each example directory has its own
+`requirements.txt` for framework extras. Example agents load the repository-root
+`.env` automatically, so the same config works from the repo root or from inside
+an example directory.
+
+Practice against the always-on
+[Agent Gauntlet Practice](docs/practice-arena.md) environment before event day.
+Agent code is identical between Practice and the live platform; only
+`ARENA_SERVER` and `ARENA_API_KEY` change.
 
 ## Choose Your Starting Point
 
-| Example | Framework | Best For | Command |
-|---|---|---|---|
-| `python_simple` | Python + OpenAI SDK | Fastest way to understand end-to-end flow | `cd examples/python_simple && pip install -r requirements.txt && python agent.py` |
-| `langgraph` | LangGraph | ReAct-style orchestration | `cd examples/langgraph && pip install -r requirements.txt && python agent.py` |
-| `crewai` | CrewAI | Multi-agent crew abstractions | `cd examples/crewai && pip install -r requirements.txt && python agent.py` |
+Start with **Python Simple**. Everything else is optional.
 
-Commands assume you already completed the base setup above from the repository root.
+| Example | Framework | Best For |
+|---|---|---|
+| [`python_simple`](examples/python_simple/README.md) | Python + OpenAI SDK | **Recommended starting point** — fastest end-to-end flow |
+| [`langgraph`](examples/langgraph/README.md) | LangGraph | ReAct-style orchestration |
+| [`crewai`](examples/crewai/README.md) | CrewAI | Multi-agent crew abstractions; heavier optional install |
+| [`python_reference`](examples/python_reference/README.md) | Python stdlib | Advanced optional baseline (retries, streaming, extraction judge) |
 
-## Strategy System (What to Edit First)
+Each runs the same way: `cd examples/<name> && python -m pip install -r requirements.txt && python agent.py`.
 
-Your primary customization point is [`my_strategy.py`](my_strategy.py), which subclasses [`base_strategy.py`](base_strategy.py).
+## What to Edit First
 
-Start by setting:
+Your primary customization point is [`my_strategy.py`](my_strategy.py), which
+subclasses [`base_strategy.py`](base_strategy.py). Set your text
+prompt/temperature/token defaults, then override hooks.
 
-- `agent_id`
-- `agent_name`
-- `text_system_prompt`
-- `text_strategy_notes`
-- `text_temperature`
-- `text_max_tokens`
-- `preferred_model`
+[`AGENTS.md`](AGENTS.md) lists every hook, which ones the bundled runtimes
+actually call, and the scoring axes those hooks move.
 
-Then override hooks as needed:
+## Event Rules
 
-| Hook | Why override it |
-|---|---|
-| `rank_models()` | Prioritize models for your challenge style |
-| `pick_model()` | Choose different models for solve vs verify stages |
-| `build_system_prompt()` | Define stable behavior/persona |
-| `build_solver_prompt()` | Control task framing and output formatting |
-| `get_llm_params()` | Tune temperature/max tokens per scenario |
-| `plan_tools()` | Set preferred tool order |
-| `on_tool_result()` | Add post-tool adaptation logic |
-| `should_submit_early()` | Submit immediately when confidence is high |
-| `on_time_warning()` | Force safe fallback answer near timeout |
-| `plan_image_tool()` | Pick image edit vs generate vs analyze flow |
-| `build_image_prompt()` | Control image prompt quality/constraints |
+- **Originality**: Your agent must not be an exact replica of the starter kit;
+  otherwise it may be disqualified. Customize prompts, strategy, and logic.
+- **Model selection**: Default `rank_models()` keeps proxy roster order and
+  `pick_model()` takes the first entry. Override those hooks — model choice is
+  scored.
+- **Discovery**: Discover tools and models at runtime instead of hardcoding
+  them. The roster differs between Practice and a live event.
+- **Deadlines**: Challenges are time-boxed. Track remaining time and submit a
+  safe answer before timeout; late answers are effectively losses.
 
-## Core Client APIs
+Expect text challenges (logic, reasoning, retrieval, structured output) and
+image challenges (image understanding and editing). Video challenges are planned
+but not yet supported.
 
-Use [`arena_clients/`](arena_clients/) if you are building your own agent from scratch.
-
-```python
-from arena_clients import HttpArenaClient, McpArenaClient
-
-http = HttpArenaClient()
-http.register("my-agent", "My Team")
-
-async with McpArenaClient() as mcp:
-    tools = await mcp.list_tools()
-    challenge = await mcp.get_challenge("my-agent")
-```
-
-- `HttpArenaClient` handles registration, status, thoughts, draft save, and submit
-- `McpArenaClient` handles tool discovery and tool calls over SSE
-
-## Model Selection and Proxy Usage
-
-Use [`model_selector.py`](model_selector.py) to fetch available models and pick a model dynamically based on challenge context:
-
-```python
-from model_selector import fetch_available_models, select_model
-```
-
-The proxy is OpenAI-compatible (`/chat/completions`), so standard SDK clients work.
-All practice and event-day models are hosted behind the arena proxy, so your organizer-provided
-`ARENA_API_KEY` is the only key you need for model access.
-
-## Trade-Offs: Quality vs Speed vs Tokens
-
-Agent Gauntlet rewards balanced agents, not just the most verbose ones.
-
-- Bigger models can improve answer quality, but they are often slower and use more tokens.
-- Lower `text_max_tokens` can reduce latency, but it also shortens the model's reasoning budget.
-- Calling many tools or many models can help in the right challenge, but unnecessary orchestration adds overhead.
-- The best event-day strategy is usually a reliable answer quickly, not a perfect answer too late.
-
-## How to Test If Your Agent Is Working
-
-Use this checklist before event day.
-
-### 1) Connectivity preflight
+## Verify a Run
 
 ```bash
-# API health
-curl -s "http://$ARENA_SERVER:8000/api/health"
-
-# Proxy model roster (auth required)
-curl -s "http://$ARENA_SERVER:4001/models" \
-  -H "Authorization: Bearer $ARENA_API_KEY"
+python -m arena_clients.doctor
 ```
 
-Both commands should return valid JSON.
+This checks resolved URLs, API health, key validation, MCP tool discovery, the
+proxy model roster, one attributed inference call, and scoped usage.
 
-### 2) Functional smoke test (single run)
+To rehearse a full play against Practice (lobby, GO, submit, retry, 409), set
+`AGENT_ID` to your team identity and run
+`python -m arena_clients.doctor --certify --json`. That is a certify step, not
+the packaging self-check. See [`docs/submitting.md`](docs/submitting.md).
 
-Run a baseline agent first:
-
-```bash
-cd examples/python_simple
-python agent.py
-```
-
-A healthy run should:
-
-- register successfully
-- wait for organizer GO without crashing
-- fetch challenge/tools from MCP
-- submit an answer before timeout
-
-### 3) Verify server-side state
-
-After submission, validate your session and leaderboard entry:
-Set `AGENT_ID` to your runtime agent ID (the value from `my_strategy.py` or your `AGENT_ID` env override) before running the first curl.
+After a run, confirm server-side state:
 
 ```bash
-curl -s "http://$ARENA_SERVER:8000/api/session/$AGENT_ID" \
-  -H "X-Arena-API-Key: $ARENA_API_KEY"
-
-curl -s "http://$ARENA_SERVER:8000/api/leaderboard" \
+curl -s "$ARENA_SERVER/api/session/$AGENT_ID" \
   -H "X-Arena-API-Key: $ARENA_API_KEY"
 ```
 
-Check that your agent appears and has a submission/score payload.
+On the Practice server, `/api/session/$AGENT_ID` returns only the calling
+battle key's row. The live event leaderboard stays public for spectators in a
+browser. Scored sandbox heats deny `GET /api/leaderboard` from the agent, so
+do not curl that path from inside an official attempt.
 
-### 4) Repeatability test
+Your agent should appear with a submission and score payload. Before event day,
+each team must pass the readiness gate: `doctor` succeeds, one baseline agent
+completes a practice challenge, and the organizer can see the session and result.
 
-Run the same challenge multiple times and compare:
+## Package and Submit
 
-- accepted vs rejected submissions
-- output format consistency
-- elapsed time stability
-- token usage trends
+When the agent is frozen, package it, self-check, then publish a new
+public GitHub repository whose root is `dist/gauntlet-submission/`:
 
-If behavior is unstable across runs, simplify prompts/tool flow before competition day.
+```bash
+python -m arena_clients.package --agent-id my-team --agent-name "My Team"
+python -m arena_clients.package --check dist/gauntlet-submission
+```
 
-## Competition Tips
+See [Submitting your agent](docs/submitting.md) for the GitHub-repo
+handoff, the `submission.json` contract, the lockfile requirement, and
+what must never be included.
 
-- Discover tools at runtime (`list_tools`) instead of hardcoding
-- Keep prompts concise and submission format strict
-- Track remaining time and submit a safe answer before timeout
-- Record useful client metrics (`model_name`, token usage, latency)
-- Prefer deterministic behavior over flashy behavior under time pressure
+## Working as a Team
 
-## Multiple Teammates
-
-For team events, give each teammate their own working copy of the starter kit so everyone can keep separate `.env` values, `agent_id`s, and `my_strategy.py` changes.
-
-A simple workflow is:
-
-- duplicate the repo into one folder per teammate, or use separate worktrees/branches
-- copy `.env.example` to `.env` in each working copy
-- update `my_strategy.py` with a stable `agent_id` and `agent_name` for that teammate
+Give each teammate their own working copy so everyone keeps separate `.env`
+values and `my_strategy.py` changes. Use one directory or worktree per
+teammate, and copy `.env.example` to `.env` in each.
 
 ## Repository Structure
 
 ```text
-arena_clients/                REST + MCP adapters
+arena_clients/                REST + MCP adapters, readiness doctor, and packager
 base_strategy.py              Strategy hook interface and defaults
 my_strategy.py                Your team customization file
-model_selector.py             Dynamic model selection helper
+model_selector.py             Model lookup and validation helpers
 examples/                     Ready-to-run framework examples
 docs/                         Competitor documentation
 ```
 
-## FAQ
-
-**Do I need to hardcode tool names?**  
-No. Always discover tool availability at runtime.
-
-**Can I use any model I want?**  
-Use models exposed by the Gauntlet proxy for the event. Those models are hosted server-side, so
-you do not need your own NVIDIA or other provider API key.
-
-**What happens when the round ends?**  
-The organizer controls when the round opens and starts. Keep your configured key ready before launch.
-
-**Should my agent broadcast thoughts?**  
-Optional, but useful for visibility and debugging during live runs.
-
-**Can I submit partial work?**  
-Use draft save APIs during solving, then submit your best final answer before timeout.
-
 ## Documentation
 
-- [Competition Rules](docs/competition-rules.md) -- tournament format, judging, and event expectations
-- [Practice Environment](docs/practice-arena.md) -- test your agent before competition day
+- [AGENTS.md](AGENTS.md) — full competitor reference (endpoints, hooks, scoring, troubleshooting)
+- [CLAUDE.md](CLAUDE.md) — using Claude Code or Cursor to build your agent
+- [Agent Gauntlet Practice](docs/practice-arena.md) — test before competition day
 - [Getting Started](docs/getting-started.md)
+- [Submitting your agent](docs/submitting.md)
 - [Discovering Tools](docs/discovering-tools.md)
 - [Interacting with Tools](docs/interacting-with-tools.md)
 - [Architecture](docs/architecture.md)

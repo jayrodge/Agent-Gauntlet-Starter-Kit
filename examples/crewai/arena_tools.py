@@ -133,6 +133,7 @@ def _looks_like_image_input_field(field_name: str, field_schema: dict[str, Any])
 @dataclass(frozen=True)
 class ToolRuntimeHints:
     accepts_agent_id: bool
+    accepts_proxy_api_key: bool
     image_input_field: str | None
 
 
@@ -173,6 +174,7 @@ def _derive_runtime_hints(input_schema: dict[str, Any]) -> ToolRuntimeHints:
 
     return ToolRuntimeHints(
         accepts_agent_id="agent_id" in properties,
+        accepts_proxy_api_key="proxy_api_key" in properties,
         image_input_field=image_input_field,
     )
 
@@ -199,6 +201,8 @@ def _derive_instruction_field(
 
     for field_name, field_schema in properties.items():
         if runtime_hints.accepts_agent_id and field_name == "agent_id":
+            continue
+        if runtime_hints.accepts_proxy_api_key and field_name == "proxy_api_key":
             continue
         if runtime_hints.image_input_field and field_name == runtime_hints.image_input_field:
             continue
@@ -257,6 +261,8 @@ def unsupported_required_fields(spec: ToolSpec) -> tuple[str, ...]:
     supported_fields: set[str] = set()
     if spec.runtime_hints.accepts_agent_id:
         supported_fields.add("agent_id")
+    if spec.runtime_hints.accepts_proxy_api_key:
+        supported_fields.add("proxy_api_key")
     if spec.runtime_hints.image_input_field:
         supported_fields.add(spec.runtime_hints.image_input_field)
     if spec.instruction_field:
@@ -370,6 +376,8 @@ def _build_args_schema(
     for field_name, field_schema in properties.items():
         if runtime_hints.accepts_agent_id and field_name == "agent_id":
             continue
+        if runtime_hints.accepts_proxy_api_key and field_name == "proxy_api_key":
+            continue
 
         annotation = _json_schema_to_annotation(field_schema)
         description = str(field_schema.get("description") or "").strip()
@@ -458,11 +466,17 @@ class ArenaToolState:
         mcp_url: str,
         api_key: str | None,
         challenge_image_uri: str = "",
+        tool_argument_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.agent_id = agent_id
         self.mcp_url = mcp_url
         self.api_key = api_key
         self.challenge_image_uri = challenge_image_uri.strip()
+        self.tool_argument_overrides = {
+            str(tool_name): dict(arguments)
+            for tool_name, arguments in (tool_argument_overrides or {}).items()
+            if isinstance(tool_name, str) and isinstance(arguments, dict)
+        }
         self.latest_image_uri = ""
         self.last_image_tool = ""
         self.tool_name_map: dict[str, str] = {}
@@ -526,7 +540,8 @@ class ArenaMcpTool(BaseTool):
         self._runtime_hints = runtime_hints
 
     def _prepare_arguments(self, raw_kwargs: dict[str, Any]) -> dict[str, Any]:
-        kwargs = dict(raw_kwargs)
+        kwargs = dict(self._state.tool_argument_overrides.get(self._original_tool_name, {}))
+        kwargs.update(raw_kwargs)
         if self._runtime_hints.accepts_agent_id:
             kwargs["agent_id"] = self._state.agent_id
         image_input_field = self._runtime_hints.image_input_field
@@ -570,6 +585,8 @@ def _build_tool_description(
     parts.append(f"Original arena MCP tool name: `{original_name}`.")
     if runtime_hints.accepts_agent_id:
         parts.append("The runtime injects `agent_id` automatically.")
+    if runtime_hints.accepts_proxy_api_key:
+        parts.append("The runtime injects `proxy_api_key` automatically when supported.")
     if runtime_hints.image_input_field:
         parts.append(
             f"If `{runtime_hints.image_input_field}` is omitted, the runtime uses the active "
@@ -594,6 +611,7 @@ def build_crewai_tools(
     mcp_url: str,
     api_key: str | None,
     challenge_image_uri: str | None = None,
+    tool_argument_overrides: dict[str, dict[str, Any]] | None = None,
     exclude_tools: set[str] | None = None,
 ) -> tuple[list[BaseTool], ArenaToolState]:
     state = ArenaToolState(
@@ -601,6 +619,7 @@ def build_crewai_tools(
         mcp_url=mcp_url,
         api_key=api_key,
         challenge_image_uri=challenge_image_uri or "",
+        tool_argument_overrides=tool_argument_overrides,
     )
     tools: list[BaseTool] = []
 

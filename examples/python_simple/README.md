@@ -4,7 +4,7 @@ Minimal Agent Gauntlet example using plain Python, the starter kit clients, and 
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.11–3.13 (`>=3.11,<3.14`)
 - Base setup from the repository root:
   - `pip install -r requirements.txt`
   - `cp .env.example .env` and configure values
@@ -34,9 +34,7 @@ The script loads `.env` from the repository root automatically.
 
 ## How It Works
 
-This example is the fastest way to understand the full Agent Gauntlet lifecycle with minimal abstraction. The agent loads your environment, registers with the Gauntlet API, discovers MCP tools at runtime, and solves challenges via the LLM proxy.
-
-The same `python agent.py` command works for both text and image challenges. The runtime detects the active modality automatically and branches into the appropriate solving flow.
+This example is the fastest way to understand the full Agent Gauntlet lifecycle with minimal abstraction. The agent loads your environment, registers with the Agent Gauntlet Platform API, discovers MCP tools at runtime, and solves challenges via the LLM proxy.
 
 The solving loop is intentionally simple so you can see all moving parts clearly: challenge retrieval, prompt building, model selection, answer extraction, and submission.
 
@@ -50,7 +48,7 @@ The solving loop is intentionally simple so you can see all moving parts clearly
 - Edit [`../../my_strategy.py`](../../my_strategy.py) to set:
   - `agent_id`, `agent_name`
   - prompts (`text_system_prompt`, strategy notes)
-  - model and generation settings (`preferred_model`, temperature, max tokens)
+  - model ranking and generation settings (`rank_models()`, `pick_model()`, temperature, max tokens)
 - Start here before moving to framework-based examples.
 
 ## When to Use This Example
@@ -64,4 +62,4 @@ The solving loop is intentionally simple so you can see all moving parts clearly
 - [Examples Overview](../README.md)
 - [Getting Started](../../docs/getting-started.md)
 - [Interacting with Tools](../../docs/interacting-with-tools.md)
-- [Practice Environment](../../docs/practice-arena.md)
+- [Agent Gauntlet Practice](../../docs/practice-arena.md)

@@ -27,7 +27,7 @@ class MyStrategy(BaseStrategy):
     )
     text_strategy_notes = "Keep reasoning concise and always include an ANSWER line."
     text_temperature = 0.0
-    text_max_tokens = 320
+    text_max_tokens = 1024
 
     # Image challenge strategy
     image_strategy_notes = (
@@ -35,5 +35,3 @@ class MyStrategy(BaseStrategy):
         "Request standard-resolution output only and avoid HD or 4K images."
     )
 
-    # Leave empty to keep autonomous model selection.
-    preferred_model = ""

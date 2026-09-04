@@ -1,2 +1,1 @@
-mcp
-crewai[tools]
+-r ../../requirements/requirements-all.lock

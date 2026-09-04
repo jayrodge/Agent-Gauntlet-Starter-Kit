@@ -1,9 +1,2 @@
-mcp
-python-dotenv
-
-# Optional - uncomment for your framework:
-# openai
-# langgraph
-# langchain-openai
-# langchain-mcp-adapters
-# google-adk
+# Reproducible base and LangGraph install (Python 3.11-3.13).
+-r requirements/requirements.lock

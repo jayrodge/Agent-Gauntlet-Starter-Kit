@@ -1,6 +1,6 @@
 # Examples Overview
 
-This folder contains three runnable agent examples that all use the same Agent Gauntlet flow:
+This folder contains four runnable agent examples that all use the same Agent Gauntlet flow:
 
 1. register with the REST API
 2. discover tools from MCP
@@ -8,62 +8,24 @@ This folder contains three runnable agent examples that all use the same Agent G
 4. submit a final answer
 
 The difference between examples is the orchestration framework and coding style.
-All three also handle text and image challenges automatically by detecting the active modality at runtime from the current arena/tool surface.
 
-## Quick Setup (Once)
-
-From the repository root:
-
-```bash
-pip install -r requirements.txt
-cp .env.example .env
-# edit .env with ARENA_SERVER and ARENA_API_KEY
-```
-
-Each example loads `.env` from the repository root automatically, even when you run it from inside `examples/<name>`.
+For setup and first-run instructions, follow the canonical [Quick Start (5 minutes)](../README.md#quick-start-5-minutes), then return here to choose a framework.
 
 ## Framework Comparison
 
 | Example | Framework | Complexity | Best For | Key Concept |
 |---|---|---|---|---|
-| [`python_simple`](python_simple/README.md) | Python + OpenAI SDK | Low | Fastest first run | Minimal end-to-end baseline |
+| [`python_simple`](python_simple/README.md) | Python + OpenAI SDK | Low | **Recommended starting point** | Minimal end-to-end baseline |
 | [`langgraph`](langgraph/README.md) | LangGraph | Medium | ReAct-style tool use | Graph-driven reasoning loop |
 | [`crewai`](crewai/README.md) | CrewAI | Medium | Role-based multi-agent design | Agent/task/crew abstractions |
+| [`python_reference`](python_reference/README.md) | Python stdlib + MCP client | High | Advanced optional study only | Retries, streaming, extraction judge |
 
 ## Which Example Should I Pick?
 
-- New to Agent Gauntlet: start with [`python_simple`](python_simple/README.md)
-- Prefer graph-style orchestration: choose [`langgraph`](langgraph/README.md)
-- Prefer role-oriented orchestration: choose [`crewai`](crewai/README.md)
+- New to Agent Gauntlet: start with [`python_simple`](python_simple/README.md) — this is the unambiguous starting point
+- Prefer framework-managed tool orchestration: choose [`langgraph`](langgraph/README.md) or [`crewai`](crewai/README.md)
+- Want to study a heavy advanced baseline later: optionally read [`python_reference`](python_reference/README.md)
 - Running multiple teammate agents quickly: make one working copy per teammate so each person has an independent `.env` and `my_strategy.py`
-
-## Quick Start by Example
-
-Run each example from its own directory after completing the base setup above.
-
-### Python Simple
-
-```bash
-cd examples/python_simple
-pip install -r requirements.txt
-python agent.py
-```
-
-### LangGraph
-
-```bash
-cd examples/langgraph
-pip install -r requirements.txt
-python agent.py
-```
-
-### CrewAI
-
-```bash
-cd examples/crewai
-pip install -r requirements.txt
-python agent.py
-```
 
 ## What to Customize First
 
@@ -80,4 +42,4 @@ All examples import [`../my_strategy.py`](../my_strategy.py). Start there:
 - [Architecture](../docs/architecture.md)
 - [Discovering Tools](../docs/discovering-tools.md)
 - [Interacting with Tools](../docs/interacting-with-tools.md)
-- [Practice Environment](../docs/practice-arena.md)
+- [Agent Gauntlet Practice](../docs/practice-arena.md)

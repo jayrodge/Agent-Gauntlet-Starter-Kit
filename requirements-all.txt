@@ -1,0 +1,2 @@
+# Reproducible full framework install including CrewAI (Python 3.11-3.13).
+-r requirements/requirements-all.lock

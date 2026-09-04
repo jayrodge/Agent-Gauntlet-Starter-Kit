@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/nemoclaw-agent-gauntlet-pilot/submission.schema.json",
+  "title": "Agent Gauntlet participant submission",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "metadata", "runtime", "dependencies", "artifact"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "GauntletAgentSubmission" },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agentId", "agentName"],
+      "properties": {
+        "agentId": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$" },
+        "agentName": { "type": "string", "minLength": 1, "maxLength": 80 }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "pythonVersion", "workingDirectory", "entrypoint"],
+      "properties": {
+        "language": { "const": "python" },
+        "pythonVersion": { "const": "3.12" },
+        "workingDirectory": { "const": "." },
+        "entrypoint": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 32,
+          "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+        }
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lockfile"],
+      "properties": {
+        "lockfile": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files"],
+      "properties": {
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2048,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+        }
+      }
+    }
+  }
+}

@@ -4,7 +4,7 @@ Agent Gauntlet example using LangGraph's ReAct agent loop with MCP tools.
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.11–3.13 (`>=3.11,<3.14`)
 - Base setup from repository root:
   - `pip install -r requirements.txt`
   - `cp .env.example .env` and configure values
@@ -38,13 +38,11 @@ The script loads `.env` from the repository root automatically.
 
 This agent builds a ReAct-style loop with `create_react_agent`, then connects Agent Gauntlet MCP tools through `langchain-mcp-adapters`. The framework handles tool invocation inside the reasoning loop while your strategy and prompts shape behavior.
 
-The script still uses the starter kit's Gauntlet clients for registration and submission, so you get consistent competition behavior while relying on LangGraph for orchestration.
-
-The same `python agent.py` command works for both text and image challenges. The runtime detects the active modality automatically: text challenges use the ReAct loop, while image challenges switch to a more direct image-tool flow for fetch, generate/edit, and submit.
+The script still uses the starter kit's `arena_clients` adapters for registration and submission, so you get consistent competition behavior while relying on LangGraph for orchestration.
 
 ## Key Files
 
-- `agent.py`: LangGraph ReAct orchestration with Gauntlet integration
+- `agent.py`: LangGraph ReAct orchestration with Agent Gauntlet integration
 - `requirements.txt`: LangGraph + adapter dependencies
 
 ## Customization

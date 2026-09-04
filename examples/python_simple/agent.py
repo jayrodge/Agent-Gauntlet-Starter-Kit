@@ -3,7 +3,7 @@
 
 This is a minimal example showing how to connect to Agent Gauntlet from any Python code.
 It uses:
-- HTTP client for Gauntlet coordination (REST API)
+- HTTP client for Agent Gauntlet coordination (REST API)
 - MCP client for challenge tools
 - OpenAI SDK for LLM calls via the proxy
 
@@ -34,18 +34,24 @@ if str(REPO_ROOT) not in sys.path:
 load_dotenv(REPO_ROOT / ".env")
 
 from arena_clients import (
+    build_image_tool_arguments,
     HttpArenaClient,
     McpArenaClient,
     McpArenaError,
     ensure_connected,
     get_api_base,
     get_arena_api_key,
-    get_llm_api_key,
     get_mcp_url,
     get_proxy_host,
+    monitor_session,
 )
+from arena_clients.proxy_headers import build_proxy_headers, resolve_usage_scope
 from base_strategy import ChallengeContext
-from model_selector import fetch_available_models, select_model
+from model_selector import (
+    ModelSelectionError,
+    fetch_available_models,
+    require_explicit_model,
+)
 from my_strategy import MyStrategy
 
 # Use OpenAI SDK for LLM calls through the proxy.
@@ -62,6 +68,25 @@ BLANK_PNG_DATA_URI = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7/"
     "S7sAAAAASUVORK5CYII="
 )
+
+
+def _plan_image_tool_sequence(
+    strategy: MyStrategy,
+    ctx: ChallengeContext,
+    available_tools: list[str],
+) -> list[str]:
+    """Expand an analysis-first choice into a usable image-output plan."""
+    selected_tool = strategy.plan_image_tool(ctx, available_tools)
+    if not selected_tool:
+        return []
+    sequence = [selected_tool]
+    if selected_tool != "image_analyze":
+        return sequence
+    if ctx.image_url and "image_edit" in available_tools:
+        sequence.append("image_edit")
+    elif "image_generate" in available_tools:
+        sequence.append("image_generate")
+    return sequence
 
 
 def extract_answer(raw_response: str) -> str:
@@ -81,6 +106,240 @@ def extract_answer(raw_response: str) -> str:
                 return answer
 
     return ""
+
+
+def _challenge_text_blob(
+    challenge_type: str,
+    description: str,
+    rules: str,
+    extra_context: str = "",
+) -> str:
+    return " ".join(
+        [challenge_type or "", description or "", rules or "", extra_context or ""]
+    ).lower()
+
+
+def _required_runtime_tools(
+    available_tool_names: list[str],
+    *,
+    challenge_type: str,
+    description: str,
+    rules: str,
+    extra_context: str = "",
+) -> list[str]:
+    blob = _challenge_text_blob(challenge_type, description, rules, extra_context)
+    required: list[str] = []
+    for tool_name in available_tool_names:
+        normalized = str(tool_name or "").strip()
+        if not normalized:
+            continue
+        if normalized.lower() in blob:
+            required.append(normalized)
+    if challenge_type.strip().lower() in {"web-search", "market-research"}:
+        for tool_name in available_tool_names:
+            normalized = str(tool_name or "").strip()
+            if "search" in normalized.lower() and normalized not in required:
+                required.append(normalized)
+    return required
+
+
+def _best_search_query(description: str, rules: str, clues: list[str] | None) -> str:
+    text = (description or "").strip()
+    if text:
+        return text
+    if clues:
+        for clue in clues:
+            if isinstance(clue, str) and clue.strip():
+                return clue.strip()
+    return (rules or "").strip()
+
+
+def _query_candidates(
+    description: str,
+    rules: str,
+    clues: list[str] | None,
+    extra_context: str = "",
+) -> list[str]:
+    candidates: list[str] = []
+    primary = _best_search_query(description, rules, clues)
+    if primary:
+        candidates.append(primary)
+    for clue in clues or []:
+        if isinstance(clue, str) and clue.strip():
+            candidates.append(clue.strip())
+    if isinstance(rules, str) and rules.strip():
+        split_parts = re.split(r"[.;\n]+", rules)
+        for part in split_parts:
+            part = part.strip()
+            if 8 <= len(part) <= 220:
+                candidates.append(part)
+    for text in [description, rules, extra_context, *(clues or [])]:
+        if not isinstance(text, str):
+            continue
+        for url in re.findall(r"https?://[^\s)>\"]+", text):
+            cleaned = url.strip().rstrip(".,);")
+            if cleaned:
+                candidates.append(cleaned)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped[:5]
+
+
+def _tool_result_text(result: object) -> str:
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result.strip()
+    if isinstance(result, (int, float, bool)):
+        return str(result)
+    if isinstance(result, list):
+        parts = [_tool_result_text(item) for item in result]
+        return "\n".join(part for part in parts if part).strip()
+    if isinstance(result, dict):
+        cleaned: dict[str, object] = {}
+        for key, value in result.items():
+            key_lower = str(key).lower()
+            if "image" in key_lower and isinstance(value, str) and len(value) > 256:
+                continue
+            cleaned[str(key)] = value
+        try:
+            return json.dumps(cleaned, ensure_ascii=False)
+        except Exception:
+            return str(cleaned)
+    return str(result)
+
+
+def _is_invalid_answer_candidate(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    lowered = text.lower()
+    if lowered.startswith(("<toolcall", "toolcall", "<think", "reasoning:", "analysis:", "action:")):
+        return True
+    blocked_tokens = ("<toolcall", "</toolcall", '"tool_calls"', "function_call")
+    return any(token in lowered for token in blocked_tokens)
+
+
+def _derive_answer_from_evidence(
+    *,
+    llm_client,
+    model_name: str,
+    challenge_description: str,
+    challenge_rules: str,
+    evidence_lines: list[str],
+) -> str:
+    if not evidence_lines:
+        return ""
+    evidence_block = "\n".join(f"- {line}" for line in evidence_lines if line.strip())
+    if not evidence_block:
+        return ""
+    try:
+        response = llm_client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Use the provided tool evidence to answer the challenge. "
+                        "Return only one final answer line that follows the challenge rules."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {challenge_description}\n"
+                        f"Rules: {challenge_rules}\n\n"
+                        f"Tool evidence:\n{evidence_block}\n\n"
+                        "Return only the final answer line."
+                    ),
+                },
+            ],
+            max_tokens=256,
+            temperature=0.0,
+        )
+    except Exception:
+        return ""
+    raw = (response.choices[0].message.content or "").strip()
+    answer = extract_answer(raw)
+    if answer:
+        return answer
+    first_line = raw.splitlines()[0].strip().strip("`\"'") if raw.strip() else ""
+    return "" if _is_invalid_answer_candidate(first_line) else first_line
+
+
+async def _enforce_required_tool_calls(
+    *,
+    mcp_client: McpArenaClient,
+    agent_id: str,
+    challenge_type: str,
+    description: str,
+    rules: str,
+    clues: list[str] | None,
+    available_tool_names: list[str],
+    http_client: HttpArenaClient,
+    extra_context: str = "",
+) -> list[str]:
+    required_runtime_tools = _required_runtime_tools(
+        available_tool_names,
+        challenge_type=challenge_type,
+        description=description,
+        rules=rules,
+        extra_context=extra_context,
+    )
+    if not required_runtime_tools:
+        return []
+
+    evidence_lines: list[str] = []
+    queries = _query_candidates(description, rules, clues, extra_context)
+    if not queries:
+        queries = [""]
+    for tool_name in required_runtime_tools:
+        is_search_like = "search" in tool_name.lower()
+        target_calls = min(len(queries), 3) if is_search_like else 1
+        calls_made = 0
+        for query in queries[:target_calls]:
+            payload_variants = [
+                {"agent_id": agent_id, "query": query},
+                {"query": query},
+                {"agent_id": agent_id, "search_query": query},
+                {"search_query": query},
+                {"agent_id": agent_id, "text": query},
+                {"text": query},
+                {"agent_id": agent_id, "url": query},
+                {"url": query},
+                {"agent_id": agent_id, "video_url": query},
+                {"video_url": query},
+                {"agent_id": agent_id},
+                {},
+            ]
+            for payload in payload_variants:
+                try:
+                    result = await mcp_client.call_tool(tool_name, payload)
+                    rendered = _tool_result_text(result)
+                    if rendered:
+                        evidence_lines.append(f"{tool_name}: {rendered[:2000]}")
+                    calls_made += 1
+                    break
+                except Exception:
+                    continue
+        status_note = (
+            f"Required tool coverage: {tool_name} ({calls_made}/{target_calls})"
+            if target_calls > 1
+            else f"Required tool called: {tool_name}"
+            if calls_made
+            else f"Could not call required tool: {tool_name}"
+        )
+        try:
+            http_client.broadcast_thought(agent_id, status_note)
+        except Exception:
+            pass
+    return evidence_lines
 
 
 def _build_context(
@@ -117,19 +376,6 @@ def _coerce_nonnegative_int(value: object, default: int = 0) -> int:
         return max(0, int(value if value is not None else default))
     except (TypeError, ValueError):
         return default
-
-
-def _resolve_usage_scope() -> str | None:
-    scope_value = str(os.getenv("ARENA_USAGE_SCOPE") or "").strip()
-    return scope_value or None
-
-
-def _build_proxy_headers(agent_id: str, usage_scope: str | None = None) -> dict[str, str]:
-    headers = {"X-Agent-ID": agent_id}
-    scope_value = str(usage_scope or "").strip()
-    if scope_value:
-        headers["X-Round-ID"] = scope_value
-    return headers
 
 
 def _fetch_proxy_usage(
@@ -198,10 +444,11 @@ async def solve_challenge(
     http_client=None,
     agent_id: str = "",
     broadcast_thought: bool = True,
+    evidence_lines: list[str] | None = None,
 ):
     """Solve the challenge using the selected LLM model.
     
-    When http_client and agent_id are provided, streams reasoning to the arena in real time.
+    When http_client and agent_id are provided, streams reasoning to Agent Gauntlet in real time.
     
     Returns:
         tuple: (extracted_answer, raw_response, model_name, usage_dict, ttft_ms, total_time_ms)
@@ -210,6 +457,12 @@ async def solve_challenge(
     _ = challenge
     _ = clues
     prompt = strategy.build_solver_prompt(ctx)
+    prompt = (
+        f"{prompt}\n\n"
+        "Output guardrails:\n"
+        "- Return only your final answer line.\n"
+        "- Do not output tool-call markup, XML tags, or thinking traces."
+    )
     system_msg = strategy.build_system_prompt(ctx)
     llm_params = strategy.get_llm_params(ctx)
     max_tokens = int(llm_params.get("max_tokens", 1024))
@@ -297,6 +550,18 @@ async def solve_challenge(
 
     total_time_ms = int(time.time() * 1000 - start_ms)
     answer = extract_answer(raw_content)
+    if _is_invalid_answer_candidate(answer):
+        answer = ""
+    if not answer and evidence_lines:
+        answer = _derive_answer_from_evidence(
+            llm_client=llm_client,
+            model_name=model_name,
+            challenge_description=str(ctx.description or ""),
+            challenge_rules=str(ctx.rules or ""),
+            evidence_lines=list(evidence_lines or []),
+        )
+        if _is_invalid_answer_candidate(answer):
+            answer = ""
     if not answer:
         strict_system_msg = (
             "Return only one line in exact format: ANSWER: <final answer>. "
@@ -319,6 +584,8 @@ async def solve_challenge(
             answer = extract_answer(raw_content)
         except Exception:
             pass
+    if _is_invalid_answer_candidate(answer):
+        answer = ""
 
     usage_dict = {
         "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
@@ -357,14 +624,14 @@ async def main():
     mcp_url = get_mcp_url()
     llm_host = get_proxy_host()
     api_key = get_arena_api_key()
-    llm_api_key = get_llm_api_key()
+    llm_api_key = api_key
 
     print(f"   API: {api_base}")
     print(f"   MCP: {mcp_url}")
     print(f"   LLM: {llm_host}")
     print()
 
-    # HTTP client for Gauntlet coordination
+    # HTTP client for Agent Gauntlet coordination
     http_client = HttpArenaClient(api_base=api_base, api_key=api_key)
 
     if not HAS_OPENAI:
@@ -375,13 +642,16 @@ async def main():
     session = http_client.register(agent_id, agent_name)
     print(f"   Session: {session.session_id}")
     print(f"   Status: {session.status}")
+    session_monitor = monitor_session(http_client, agent_id).start()
     
     # Step 2: Get challenge from MCP
     print("\n🎯 Getting challenge...")
     async with McpArenaClient(mcp_url) as mcp_client:
         tools = await mcp_client.list_tools()
+        tool_defs = await mcp_client.list_tool_defs()
         modality = McpArenaClient.detect_modality(tools)
-        usage_scope = http_client.fetch_usage_scope() or _resolve_usage_scope()
+        image_tool_proxy_args: dict[str, dict[str, str]] = {}
+        usage_scope = http_client.fetch_usage_scope() or resolve_usage_scope()
         if usage_scope:
             os.environ["ARENA_USAGE_SCOPE"] = usage_scope
 
@@ -478,7 +748,7 @@ async def main():
             print(f"   Type: {challenge.challenge_type}")
             print(f"   Puzzle: {challenge.puzzle_id}")
             print(f"   Time limit: {challenge.max_time_s}s")
-            usage_scope = http_client.fetch_usage_scope() or _resolve_usage_scope()
+            usage_scope = http_client.fetch_usage_scope() or resolve_usage_scope()
             if usage_scope:
                 os.environ["ARENA_USAGE_SCOPE"] = usage_scope
 
@@ -499,16 +769,21 @@ async def main():
             )
             ranked_models = strategy.rank_models(image_ctx, available_models)
             model_name = strategy.pick_model("solve", ranked_models, image_ctx)
-            if model_name not in available_models:
-                model_name = select_model(
-                    challenge_type=challenge.challenge_type,
-                    challenge_description=challenge.description,
-                    challenge_rules=image_rules,
-                    max_time_s=challenge.max_time_s,
-                    available_models=available_models,
-                    proxy_host=llm_host,
-                    api_key=llm_api_key,
+            model_name = require_explicit_model(
+                model_name,
+                available_models,
+                source="python_simple agent",
+            )
+            image_tool_proxy_args = {
+                tool_name: build_image_tool_arguments(
+                    tool_defs,
+                    tool_name,
+                    selected_model=model_name,
+                    llm_api_key=llm_api_key,
+                    arena_api_key=api_key,
                 )
+                for tool_name in ("image_edit", "image_generate", "image_analyze")
+            }
             print(f"   Selected model: {model_name}")
             http_client.broadcast_thought(agent_id, f"Selected planner model: {model_name}")
             await _start_metrics_reporter(model_name)
@@ -520,27 +795,77 @@ async def main():
                 for tool_name in ("image_edit", "image_generate", "image_analyze")
                 if tool_name in tools
             ]
-            selected_tool = strategy.plan_image_tool(image_ctx, image_tools)
+            image_tool_sequence = _plan_image_tool_sequence(
+                strategy,
+                image_ctx,
+                image_tools,
+            )
+            selected_tool = image_tool_sequence[-1] if image_tool_sequence else ""
             tool_result: dict = {}
+            mcp_session_dead = False
+
+            async def _call_image_tool(name: str, arguments: dict) -> dict:
+                nonlocal mcp_session_dead
+                try:
+                    result = await mcp_client.call_tool(name, arguments)
+                    return result if isinstance(result, dict) else {}
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    mcp_session_dead = True
+                    print(f"   Image tool {name} failed ({type(exc).__name__}): {exc}")
+                    return {}
+
+            if (
+                len(image_tool_sequence) > 1
+                and image_tool_sequence[0] == "image_analyze"
+                and challenge.input_image_uri
+            ):
+                print("   Using image_analyze before output tool")
+                analysis_result = await _call_image_tool(
+                    "image_analyze",
+                    {
+                        "image_uri": challenge.input_image_uri,
+                        "question": prompt_text,
+                        "agent_id": agent_id,
+                        **image_tool_proxy_args.get("image_analyze", {}),
+                    },
+                )
+                analysis_text = str(analysis_result.get("text") or "").strip()
+                if analysis_text:
+                    http_client.broadcast_thought(
+                        agent_id,
+                        f"Image analysis: {analysis_text[:180]}",
+                    )
+                    prompt_text = (
+                        f"{prompt_text}\n\n"
+                        "Source-image analysis to preserve while transforming: "
+                        f"{analysis_text[:1000]}"
+                    )
             if (
                 selected_tool == "image_edit"
                 and challenge.input_image_uri
                 and "image_edit" in image_tools
             ):
                 print("   Using image_edit tool")
-                tool_result = await mcp_client.call_tool(
+                tool_result = await _call_image_tool(
                     "image_edit",
                     {
                         "image_uri": challenge.input_image_uri,
                         "prompt": prompt_text,
                         "agent_id": agent_id,
+                        **image_tool_proxy_args.get("image_edit", {}),
                     },
                 )
             elif selected_tool == "image_generate" and "image_generate" in image_tools:
                 print("   Using image_generate tool")
-                tool_result = await mcp_client.call_tool(
+                tool_result = await _call_image_tool(
                     "image_generate",
-                    {"prompt": prompt_text, "agent_id": agent_id},
+                    {
+                        "prompt": prompt_text,
+                        "agent_id": agent_id,
+                        **image_tool_proxy_args.get("image_generate", {}),
+                    },
                 )
             elif (
                 selected_tool == "image_analyze"
@@ -548,12 +873,13 @@ async def main():
                 and "image_analyze" in image_tools
             ):
                 print("   Using image_analyze tool (no image output tool available)")
-                tool_result = await mcp_client.call_tool(
+                tool_result = await _call_image_tool(
                     "image_analyze",
                     {
                         "image_uri": challenge.input_image_uri,
                         "question": prompt_text,
                         "agent_id": agent_id,
+                        **image_tool_proxy_args.get("image_analyze", {}),
                     },
                 )
                 analysis_text = str(tool_result.get("text") or "").strip()
@@ -564,19 +890,24 @@ async def main():
                     )
             elif challenge.input_image_uri and "image_edit" in image_tools:
                 selected_tool = "image_edit"
-                tool_result = await mcp_client.call_tool(
+                tool_result = await _call_image_tool(
                     "image_edit",
                     {
                         "image_uri": challenge.input_image_uri,
                         "prompt": prompt_text,
                         "agent_id": agent_id,
+                        **image_tool_proxy_args.get("image_edit", {}),
                     },
                 )
             elif "image_generate" in image_tools:
                 selected_tool = "image_generate"
-                tool_result = await mcp_client.call_tool(
+                tool_result = await _call_image_tool(
                     "image_generate",
-                    {"prompt": prompt_text, "agent_id": agent_id},
+                    {
+                        "prompt": prompt_text,
+                        "agent_id": agent_id,
+                        **image_tool_proxy_args.get("image_generate", {}),
+                    },
                 )
 
             if tool_result.get("error"):
@@ -586,25 +917,43 @@ async def main():
             if not output_image_uri and challenge.input_image_uri:
                 output_image_uri = challenge.input_image_uri
             if not output_image_uri:
+                if mcp_session_dead:
+                    await session_monitor.stop()
+                    raise RuntimeError(
+                        "Image MCP tool failed and no input_image_uri is available "
+                        "to submit; refusing to invent image bytes"
+                    )
                 output_image_uri = BLANK_PNG_DATA_URI
 
             total_time_ms = int(time.time() * 1000 - start_ms)
             await _stop_metrics_reporter()
-            image_submit_result = await mcp_client.submit_image(
-                agent_id=agent_id,
-                image_uri=output_image_uri,
-                client_metrics={
-                    "model_name": model_name,
-                    "planner_tool": selected_tool,
-                    "total_tokens": str(live_total_tokens),
-                    "prompt_tokens": str(live_prompt_tokens),
-                    "completion_tokens": str(live_completion_tokens),
-                    "ttft_ms": 0,
-                    "total_time_ms": total_time_ms,
-                },
-                rationale="simple_agent dynamic image flow",
-            )
+            client_metrics = {
+                "model_name": model_name,
+                "planner_tool": selected_tool,
+                "total_tokens": str(live_total_tokens),
+                "prompt_tokens": str(live_prompt_tokens),
+                "completion_tokens": str(live_completion_tokens),
+                "ttft_ms": 0,
+                "total_time_ms": total_time_ms,
+            }
+            if mcp_session_dead:
+                await session_monitor.stop()
+                print("   MCP session unavailable; submitting image over REST")
+                image_submit_result = http_client.submit(
+                    agent_id,
+                    answer=output_image_uri,
+                    client_metrics=client_metrics,
+                    challenge_type="image",
+                )
+            else:
+                image_submit_result = await mcp_client.submit_image(
+                    agent_id=agent_id,
+                    image_uri=output_image_uri,
+                    client_metrics=client_metrics,
+                    rationale="simple_agent dynamic image flow",
+                )
             print(f"   Image submission: {image_submit_result}")
+            await session_monitor.stop()
             print("\n✅ Agent completed!")
             return
 
@@ -624,13 +973,13 @@ async def main():
         print(f"   Type: {challenge.challenge_type}")
         print(f"   Puzzle: {challenge.puzzle_id}")
         print(f"   Time limit: {challenge.max_time_s}s")
-        usage_scope = http_client.fetch_usage_scope() or _resolve_usage_scope()
+        usage_scope = http_client.fetch_usage_scope() or resolve_usage_scope()
         if usage_scope:
             os.environ["ARENA_USAGE_SCOPE"] = usage_scope
         llm_client = OpenAI(
             base_url=llm_host,
             api_key=llm_api_key,
-            default_headers=_build_proxy_headers(agent_id, usage_scope),
+            default_headers=build_proxy_headers(agent_id, usage_scope),
         )
         print("   LLM: Enabled")
         print()
@@ -645,16 +994,11 @@ async def main():
         )
         ranked_models = strategy.rank_models(model_ctx, available_models)
         model_name = strategy.pick_model("solve", ranked_models, model_ctx)
-        if model_name not in available_models:
-            model_name = select_model(
-                challenge_type=challenge.challenge_type,
-                challenge_description=challenge.description,
-                challenge_rules=challenge.rules,
-                max_time_s=challenge.max_time_s,
-                available_models=available_models,
-                proxy_host=llm_host,
-                api_key=llm_api_key,
-            )
+        model_name = require_explicit_model(
+            model_name,
+            available_models,
+            source="python_simple agent",
+        )
         print(f"   Selected model: {model_name}")
         await _start_metrics_reporter(model_name)
         
@@ -671,6 +1015,18 @@ async def main():
             print(f"   Clue {i}: {clue.text[:50]}...")
         if not clues:
             clues = [str(clue_text) for clue_text in challenge.clues]
+
+        tool_evidence_lines = await _enforce_required_tool_calls(
+            mcp_client=mcp_client,
+            agent_id=agent_id,
+            challenge_type=str(challenge.challenge_type or ""),
+            description=str(challenge.description or ""),
+            rules=str(challenge.rules or ""),
+            clues=clues,
+            available_tool_names=[str(name) for name in tools],
+            http_client=http_client,
+            extra_context=str(getattr(challenge, "extra_text", "") or ""),
+        )
         
         # Broadcast thought
         http_client.broadcast_thought(agent_id, f"Analyzing {len(clues)} clues...")
@@ -700,16 +1056,23 @@ async def main():
             http_client=http_client,
             agent_id=agent_id,
             broadcast_thought=True,
+            evidence_lines=tool_evidence_lines,
         )
         print(f"   Raw LLM output: {raw_response[:120]}...")
         print(f"   Extracted answer: {answer}")
         print(f"   Model: {model_name} | Tokens: {usage.get('total_tokens', 0)} | Time: {total_time_ms}ms")
         
+        if _is_invalid_answer_candidate(answer):
+            answer = ""
         if not answer:
             print("   ⚠️  No valid ANSWER format found; using last line as fallback.")
             lines = raw_response.strip().splitlines()
             last_line = lines[-1].strip().strip("`\"'") if lines else ""
-            answer = last_line if last_line and len(last_line) < 400 else "unknown"
+            answer = (
+                last_line
+                if last_line and len(last_line) < 400 and not _is_invalid_answer_candidate(last_line)
+                else "unknown"
+            )
 
         # Save draft with extracted answer as backup
         http_client.save_draft(agent_id, answer, "LLM solution")
@@ -760,8 +1123,15 @@ async def main():
         print(f"   Quality: {result.score.get('quality_score', 0)}")
         print(f"   Speed: {result.score.get('speed_score', 0)}")
     
+    await session_monitor.stop()
     print("\n✅ Agent completed!")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except asyncio.CancelledError:
+        raise SystemExit(0)
+    except ModelSelectionError as exc:
+        print(f"   {exc}")
+        raise SystemExit(1)

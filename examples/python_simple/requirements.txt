@@ -1,2 +1,1 @@
-mcp
-openai
+-r ../../requirements/requirements.lock

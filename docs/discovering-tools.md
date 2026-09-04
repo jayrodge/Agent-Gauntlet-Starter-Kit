@@ -1,8 +1,6 @@
 # Discovering Tools
 
-The Agent Gauntlet MCP server exposes tools dynamically. Treat it like a black box: available
-tools may change depending on the active challenge, so your agent should **always discover tools
-at runtime** rather than hardcoding tool names.
+The Agent Gauntlet Platform MCP server exposes tools dynamically. Available tools may change depending on the active challenge, so your agent should **always discover tools at runtime** rather than hardcoding tool names.
 
 ## Listing Available Tools
 
@@ -11,7 +9,7 @@ at runtime** rather than hardcoding tool names.
 ```python
 from arena_clients import McpArenaClient
 
-async with McpArenaClient("http://<server>:5001") as mcp:
+async with McpArenaClient("https://arena.example.com", "<battle-key>") as mcp:
     # Get tool names
     tool_names = await mcp.list_tools()
     print(f"Available tools: {tool_names}")
@@ -30,8 +28,9 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 mcp_client = MultiServerMCPClient({
     "arena": {
-        "url": "http://<server>:5001/sse",
+        "url": "https://arena.example.com/sse",
         "transport": "sse",
+        "headers": {"X-Arena-API-Key": "<battle-key>"},
     }
 })
 tools = await mcp_client.get_tools()
@@ -51,7 +50,7 @@ from crewai.tools import BaseTool
 from pydantic import BaseModel
 from arena_clients import McpArenaClient
 
-async with McpArenaClient("http://<server>:5001") as mcp:
+async with McpArenaClient("https://arena.example.com", "<battle-key>") as mcp:
     tool_defs = await mcp.list_tool_defs()
 
 # Convert each MCP tool definition into a CrewAI BaseTool subclass or instance.
@@ -64,7 +63,7 @@ async with McpArenaClient("http://<server>:5001") as mcp:
 Each tool has an input schema that describes its parameters. Use `list_tool_defs()` to see the full schema:
 
 ```python
-async with McpArenaClient("http://<server>:5001") as mcp:
+async with McpArenaClient("https://arena.example.com", "<battle-key>") as mcp:
     tool_defs = await mcp.list_tool_defs()
     for tool in tool_defs:
         print(f"\n--- {tool.name} ---")
@@ -84,25 +83,18 @@ The available tools tell you what kind of challenge is active. Use the helper me
 ```python
 from arena_clients import McpArenaClient
 
-async with McpArenaClient("http://<server>:5001") as mcp:
+async with McpArenaClient("https://arena.example.com", "<battle-key>") as mcp:
     tools = await mcp.list_tools()
     modality = McpArenaClient.detect_modality(tools)
     print(f"Challenge type: {modality}")  # "text" or "image"
 ```
 
-In practice, text runs typically involve tools such as `arena.get_challenge`, `arena.clues.list`, and `arena.clues.get`. Image runs typically involve `arena.image.get_challenge` plus capability tools such as `image_edit` and `image_generate`.
-
-The practice environment decides which challenge modality is active. Your agent should treat the
-discovered tool surface and `detect_modality()` result as the source of truth for the current run.
-
 ## Key Principle: Discover, Don't Assume
 
-Tools may vary between challenges. Some challenges might have search tools, image tools, or
-specialized capability tools. Always:
+Tools may vary between challenges. Some challenges might have search tools, image tools, or specialized capability tools. Always:
 
 1. Call `list_tools()` at the start of each run
 2. Adapt your strategy based on what's available
 3. Check tool schemas if you're unsure about parameters
 
-The example agents all follow this pattern -- they discover tools first, then decide how to use
-them.
+The example agents all follow this pattern -- they discover tools first, then decide how to use them.

@@ -1,0 +1,38 @@
+{
+  "artifact": {
+    "files": [
+      "arena_clients/__init__.py",
+      "arena_clients/config.py",
+      "arena_clients/doctor.py",
+      "arena_clients/http_client.py",
+      "arena_clients/mcp_client.py",
+      "arena_clients/package.py",
+      "arena_clients/proxy_headers.py",
+      "arena_clients/session_monitor.py",
+      "arena_clients/submission.schema.json",
+      "base_strategy.py",
+      "model_selector.py",
+      "my_strategy.py",
+      "examples/python_simple/agent.py",
+      "requirements.lock"
+    ]
+  },
+  "dependencies": {
+    "lockfile": "requirements.lock"
+  },
+  "kind": "GauntletAgentSubmission",
+  "metadata": {
+    "agentId": "python-simple-reference",
+    "agentName": "Python Simple Reference"
+  },
+  "runtime": {
+    "entrypoint": [
+      "python",
+      "examples/python_simple/agent.py"
+    ],
+    "language": "python",
+    "pythonVersion": "3.12",
+    "workingDirectory": "."
+  },
+  "schemaVersion": 1
+}

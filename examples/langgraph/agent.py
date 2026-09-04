@@ -34,36 +34,41 @@ load_dotenv(REPO_ROOT / ".env")
 from arena_clients import (
     ArenaAPIError,
     ArenaConnectionError,
+    build_image_tool_arguments,
     HttpArenaClient,
     McpArenaClient,
     McpArenaError,
     ensure_connected,
     get_api_base,
     get_arena_api_key,
-    get_llm_api_key,
     get_mcp_url,
     get_proxy_host,
+    monitor_session,
 )
+from arena_clients.proxy_headers import build_proxy_headers, resolve_usage_scope
 from base_strategy import ChallengeContext
-from model_selector import fetch_available_models, select_model
+from model_selector import (
+    ModelSelectionError,
+    fetch_available_models,
+    require_explicit_model,
+)
 from my_strategy import MyStrategy
 
 
 DEFAULT_AGENT_ID = "langgraph-agent"
 DEFAULT_AGENT_NAME = "LangGraph Agent"
 DEFAULT_TEXT_SYSTEM_PROMPT = (
-    "You are a logic puzzle solver. "
-    "Return the final ordering on the FIRST line using exactly: "
-    "ANSWER: Name1, Name2, Name3, Name4, Name5. "
+    "You are a high-precision challenge solver. "
+    "Follow challenge rules exactly, especially output format requirements. "
+    "Return a final answer that is easy to extract and score. "
     "Do not output <think> tags. "
-    "If you add reasoning, keep it to at most 2 short lines after the ANSWER line. "
+    "Do not include reasoning unless rules explicitly require it; otherwise output only the final answer line. "
     "Never output 'unknown'."
 )
 DEFAULT_TEXT_STRATEGY_NOTES = ""
 DEFAULT_IMAGE_STRATEGY_NOTES = ""
 DEFAULT_TEXT_TEMPERATURE = 0.0
-DEFAULT_TEXT_MAX_TOKENS = 1024
-DEFAULT_PREFERRED_MODEL = ""
+DEFAULT_TEXT_MAX_TOKENS = 3072
 BLANK_PNG_DATA_URI = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7/"
@@ -96,14 +101,6 @@ def _coerce_nonnegative_int(value: object, default: int = 0) -> int:
         return max(0, int(value if value is not None else default))
     except (TypeError, ValueError):
         return default
-
-
-def _build_proxy_headers(agent_id: str, usage_scope: str | None = None) -> dict[str, str]:
-    headers = {"X-Agent-ID": agent_id}
-    scope_value = str(usage_scope or "").strip()
-    if scope_value:
-        headers["X-Round-ID"] = scope_value
-    return headers
 
 
 def _fetch_proxy_usage(
@@ -175,23 +172,6 @@ def _build_context(
     )
 
 
-def _resolve_preferred_model(available_models: list[str]) -> str | None:
-    preferred = (
-        os.getenv("PREFERRED_MODEL")
-        or str(getattr(STRATEGY, "preferred_model", "")).strip()
-        or DEFAULT_PREFERRED_MODEL
-    ).strip()
-    if not preferred:
-        return None
-    if available_models and preferred not in available_models:
-        print(
-            f"   Preferred model '{preferred}' not in proxy model list; "
-            "falling back to autonomous selection.",
-        )
-        return None
-    return preferred
-
-
 async def _wait_for_start_gate(http_client: HttpArenaClient, agent_id: str) -> None:
     """Wait for organizer start and respect competition eligibility gate."""
     await asyncio.to_thread(http_client.update_status, agent_id, "ready")
@@ -233,7 +213,7 @@ async def _wait_for_start_gate(http_client: HttpArenaClient, agent_id: str) -> N
                     await asyncio.to_thread(
                         http_client.broadcast_thought,
                         agent_id,
-                        "⏸️ Battle already running. Waiting for next round.",
+                        "⏸️ Battle already running. Waiting for next battle.",
                     )
                     waiting_for_next_round = True
                 await asyncio.sleep(1.0)
@@ -283,26 +263,293 @@ def _check_dependencies():
         return False
 
 
-def extract_answer(raw_response: str) -> str:
-    """Extract the strict ANSWER line from the LLM response."""
-    # Strip closed and unclosed <think> blocks
-    cleaned = re.sub(r"<think>.*?</think>", "", raw_response, flags=re.DOTALL).strip()
-    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL).strip()
+def _build_mcp_sse_connection(mcp_url: str, api_key: str) -> dict[str, object]:
+    """Build an SSE connection without putting credentials in the URL."""
+    connection: dict[str, object] = {
+        "url": f"{mcp_url.rstrip('/')}/sse",
+        "transport": "sse",
+    }
+    if api_key:
+        connection["headers"] = {"X-Arena-API-Key": api_key}
+    return connection
 
-    for line in cleaned.splitlines():
-        match = re.search(r"ANSWER:\s*(.+)", line, flags=re.IGNORECASE)
-        if not match:
+
+def _strip_think_blocks(text: str) -> str:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL).strip()
+    return cleaned
+
+
+def _requires_single_line_answer(rules: str) -> bool:
+    lowered = (rules or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "exactly one line",
+            "one line only",
+            "return exactly one line",
+            "nothing else",
+            "output format",
+            "template:",
+        )
+    )
+
+
+def _answer_prefix_explicitly_allowed(rules: str) -> bool:
+    lowered = (rules or "").lower()
+    return "optional prefix 'answer:" in lowered or "optional prefix \"answer:" in lowered
+
+
+def _answer_prefix_explicitly_disallowed(rules: str) -> bool:
+    lowered = (rules or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "do not add prefixes",
+            "do not include prefixes",
+            "without prefix",
+            "no prefix",
+            "invalid example: answer:",
+        )
+    )
+
+
+def _build_output_instruction(rules: str) -> str:
+    if _requires_single_line_answer(rules):
+        if _answer_prefix_explicitly_allowed(rules):
+            return (
+                "Return exactly one final answer line matching the required format. "
+                "An optional 'ANSWER: ' prefix is allowed only if it is immediately "
+                "followed by the valid payload."
+            )
+        if _answer_prefix_explicitly_disallowed(rules):
+            return (
+                "Return exactly one final answer line matching the required format. "
+                "Do not add any prefixes or wrapper text."
+            )
+        return (
+            "Return exactly one final answer line matching the required format. "
+            "Avoid wrapper text or extra lines."
+        )
+    return (
+        "Return the final answer clearly. "
+        "If the rules define a strict output format, follow that format exactly."
+    )
+
+
+def _extract_semicolon_tuple_line(text: str) -> str:
+    for line in text.splitlines():
+        candidate = line.strip().strip("`")
+        if not candidate:
             continue
-        answer = match.group(1).strip().strip("`\"' .")
-        lowered = answer.lower()
-        if (
-            answer
-            and "<final answer>" not in lowered
-            and "return nothing except" not in lowered
-            and "follow challenge rules exactly" not in lowered
-        ):
-            return answer
+        if candidate.lower().startswith("answer:"):
+            candidate = candidate.split(":", 1)[1].strip()
+        parts = [part.strip() for part in candidate.split(";") if part.strip()]
+        if len(parts) < 2:
+            continue
+        normalized_parts: list[str] = []
+        valid = True
+        for part in parts:
+            match = re.fullmatch(
+                r"([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*([A-Za-z_][A-Za-z0-9_-]*)\s*([,:])\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\)",
+                part,
+            )
+            if not match:
+                valid = False
+                break
+            key, category, _sep, severity = match.groups()
+            normalized_parts.append(f"{key}({category},{severity})")
+        if valid:
+            return "; ".join(normalized_parts)
     return ""
+
+
+def _extract_payload_line(answer: str) -> str:
+    line = str(answer or "").strip().strip("`")
+    if line.lower().startswith("answer:"):
+        line = line.split(":", 1)[1].strip()
+    return line
+
+
+def _parse_tuple_payload(line: str) -> list[tuple[str, str, str]] | None:
+    payload = _extract_payload_line(line)
+    parts = [part.strip() for part in payload.split(";") if part.strip()]
+    if len(parts) < 2:
+        return None
+    parsed: list[tuple[str, str, str]] = []
+    for part in parts:
+        match = re.fullmatch(
+            r"([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*([A-Za-z_][A-Za-z0-9_-]*)\s*,\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\)",
+            part,
+        )
+        if not match:
+            return None
+        parsed.append((match.group(1), match.group(2), match.group(3)))
+    return parsed
+
+
+def _expected_key_order_from_rules(rules: str) -> list[str]:
+    if not isinstance(rules, str):
+        return []
+    match = re.search(r"(?:key order|use this key order)\s*:\s*([^\n.]+)", rules, re.IGNORECASE)
+    if not match:
+        return []
+    raw = match.group(1)
+    keys = [part.strip() for part in raw.split(",") if part.strip()]
+    normalized = [key for key in keys if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)]
+    return normalized
+
+
+def _normalize_tuple_payload(answer: str) -> str:
+    parsed = _parse_tuple_payload(answer)
+    if not parsed:
+        return _extract_payload_line(answer)
+    return "; ".join(f"{key}({category},{severity})" for key, category, severity in parsed)
+
+
+def _is_schema_compliant_answer(answer: str, rules: str) -> bool:
+    parsed = _parse_tuple_payload(answer)
+    if not parsed:
+        return False
+    expected_order = _expected_key_order_from_rules(rules)
+    if not expected_order:
+        return True
+    keys = [key for key, _, _ in parsed]
+    return keys == expected_order
+
+
+def _best_effort_single_line(text: str) -> str:
+    best = ""
+    best_score = -10
+    for raw_line in text.splitlines():
+        line = raw_line.strip().strip("`")
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered.startswith(("<think", "reasoning", "analysis")):
+            continue
+        score = 0
+        if ";" in line:
+            score += 4
+        if "(" in line and ")" in line:
+            score += 3
+        if "," in line:
+            score += 1
+        if len(line.split()) <= 18:
+            score += 1
+        if line.startswith(("-", "*", "#")):
+            score -= 2
+        if score > best_score:
+            best = line
+            best_score = score
+    return best if best_score >= 1 else ""
+
+
+def _extract_inline_answer_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    patterns = (
+        r"(?:thus|therefore)?\s*(?:final\s+answer|answer)\s*:\s*(?:ANSWER:\s*)?[\"'`]?(.+?)[\"'`]?\s*$",
+        r"(?:thus|therefore)\s+(?:unique\s+)?order\s*:\s*[\"'`]?(.+?)[\"'`]?\s*$",
+        r"(?:final answer(?: line)?(?: should be)?|answer(?: line)?(?: should be)?|output would be)\s*[:=]\s*[\"'`]?(.+?)[\"'`]?\s*$",
+        r"(?:therefore|thus)\s*,?\s*the answer is\s*[\"'`]?(.+?)[\"'`]?\s*$",
+    )
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        for pattern in patterns:
+            match = re.search(pattern, line, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = match.group(1).strip().strip("`\"' .")
+            if candidate:
+                candidates.append(candidate)
+    for quoted in re.findall(r"[\"']([^\"'\n]{4,220})[\"']", text):
+        candidate = quoted.strip().strip("`\"' .")
+        if candidate:
+            candidates.append(candidate)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def _is_invalid_answer_candidate(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    lowered = text.lower()
+    if re.fullmatch(r"name\s*1\s*,\s*name\s*2(?:\s*,\s*name\s*\d+)+", lowered):
+        return True
+    blocked_prefixes = (
+        "<toolcall",
+        "toolcall",
+        "<think",
+        "reasoning:",
+        "analysis:",
+        "observation:",
+        "action:",
+    )
+    if lowered.startswith(blocked_prefixes):
+        return True
+    blocked_tokens = (
+        "<toolcall",
+        "</toolcall",
+        '"tool_calls"',
+        "function_call",
+    )
+    return any(token in lowered for token in blocked_tokens)
+
+
+def extract_answer(raw_response: str, rules: str = "") -> str:
+    """Extract a final answer line with progressive fallbacks."""
+    raw_text = str(raw_response or "")
+    cleaned = _strip_think_blocks(raw_text)
+
+    for source in (cleaned, raw_text):
+        if not source:
+            continue
+        # 1) Preferred contract: explicit ANSWER line.
+        for line in source.splitlines():
+            match = re.search(r"ANSWER:\s*(.+)", line, flags=re.IGNORECASE)
+            if not match:
+                continue
+            answer = match.group(1).strip().strip("`\"' .")
+            if answer.lower().startswith("answer:"):
+                answer = answer.split(":", 1)[1].strip().strip("`\"' .")
+            lowered = answer.lower()
+            if (
+                answer
+                and "<final answer>" not in lowered
+                and "return nothing except" not in lowered
+                and "follow challenge rules exactly" not in lowered
+                and not _is_invalid_answer_candidate(answer)
+            ):
+                return answer
+
+        # 2) Structured one-line tuple output like KEY(category,severity);...
+        structured = _extract_semicolon_tuple_line(source)
+        if structured:
+            return structured
+
+        # 3) Inline / quoted candidate fallback from noisy reasoning.
+        for candidate in _extract_inline_answer_candidates(source):
+            if not _is_invalid_answer_candidate(candidate):
+                return candidate
+
+    # 4) For strict one-line tasks, prefer tuple-like payloads.
+    if _requires_single_line_answer(rules):
+        tuple_line = _extract_semicolon_tuple_line(cleaned or raw_text)
+        if tuple_line:
+            return tuple_line
+    # 5) Generic fallback: return the best concise line (e.g., "Microsoft").
+    fallback = _best_effort_single_line(cleaned) or _best_effort_single_line(raw_text)
+    return "" if _is_invalid_answer_candidate(fallback) else fallback
 
 
 def _extract_ordered_answer_from_rules(rules: str) -> str:
@@ -341,6 +588,38 @@ def _extract_image_uri_from_tool_result(result: dict) -> str:
     if isinstance(image_uri, str):
         return image_uri.strip()
     return ""
+
+
+def _merge_tool_arguments(
+    payload: dict[str, object] | None,
+    extra_args: dict[str, str] | None,
+) -> dict[str, object]:
+    merged = dict(payload or {})
+    for key, value in (extra_args or {}).items():
+        merged.setdefault(key, value)
+    return merged
+
+
+def _wrap_tool_with_extra_args(tool: object, extra_args: dict[str, str] | None) -> object:
+    if not extra_args:
+        return tool
+
+    from langchain_core.tools import StructuredTool
+
+    async def _arun(**kwargs):
+        return await tool.ainvoke(_merge_tool_arguments(kwargs, extra_args))
+
+    def _run(**kwargs):
+        return tool.invoke(_merge_tool_arguments(kwargs, extra_args))
+
+    return StructuredTool.from_function(
+        func=_run,
+        coroutine=_arun,
+        name=str(getattr(tool, "name", "")),
+        description=str(getattr(tool, "description", "")),
+        args_schema=getattr(tool, "args_schema", None),
+        return_direct=bool(getattr(tool, "return_direct", False)),
+    )
 
 
 def _message_field(message: object, field: str) -> object:
@@ -396,6 +675,34 @@ def _extract_latest_message_text(messages: object) -> str:
             if text:
                 return text
     return ""
+
+
+def _extract_transcript_text(messages: object) -> str:
+    """Best-effort transcript extraction when latest assistant text is empty.
+
+    Some LangGraph runs end with tool metadata or structured payloads where the
+    "latest message text" helper can miss useful content. This fallback collects
+    assistant text candidates across the full message list.
+    """
+    if not isinstance(messages, list):
+        return ""
+
+    chunks: list[str] = []
+    for message in messages:
+        if _message_kind(message) not in {"ai", "assistant"}:
+            continue
+        for field in ("content", "artifact", "additional_kwargs"):
+            text = _message_payload_to_text(_message_field(message, field))
+            if text:
+                chunks.append(text)
+                break
+
+    if not chunks:
+        return ""
+
+    joined = "\n\n".join(chunks).strip()
+    # Keep retry prompt bounded and deterministic.
+    return joined[-6000:]
 
 
 def _extract_image_output_from_payload(payload: object, *, _depth: int = 0) -> tuple[str, str]:
@@ -472,6 +779,293 @@ def _derive_react_timeout_s(max_time_s: int, modality: str) -> float:
     return 80.0 if modality == "image" else 90.0
 
 
+def _challenge_text_blob(
+    challenge_type: str,
+    description: str,
+    rules: str,
+    extra_context: str = "",
+) -> str:
+    return " ".join(
+        [challenge_type or "", description or "", rules or "", extra_context or ""]
+    ).lower()
+
+
+def _required_runtime_tools(
+    available_tool_names: list[str],
+    *,
+    challenge_type: str,
+    description: str,
+    rules: str,
+    extra_context: str = "",
+) -> list[str]:
+    blob = _challenge_text_blob(challenge_type, description, rules, extra_context)
+    required: list[str] = []
+    for tool_name in available_tool_names:
+        normalized = str(tool_name or "").strip()
+        if not normalized:
+            continue
+        if normalized.lower() in blob:
+            required.append(normalized)
+    if challenge_type.strip().lower() in {"web-search", "market-research"}:
+        for tool_name in available_tool_names:
+            normalized = str(tool_name or "").strip()
+            if not normalized:
+                continue
+            if "search" in normalized.lower() and normalized not in required:
+                required.append(normalized)
+    return required
+
+
+def _best_search_query(
+    description: str,
+    rules: str,
+    clues: list[str] | None,
+    extra_context: str = "",
+) -> str:
+    for text in [extra_context, description, rules, *(clues or [])]:
+        if not isinstance(text, str):
+            continue
+        match = re.search(r"https?://[^\s)>\"]+", text)
+        if match:
+            return match.group(0).strip().rstrip(".,);")
+    text = (description or "").strip()
+    if text:
+        return text
+    if clues:
+        for clue in clues:
+            if isinstance(clue, str) and clue.strip():
+                return clue.strip()
+    return (rules or "").strip()
+
+
+def _tool_result_text(result: object) -> str:
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result.strip()
+    if isinstance(result, (int, float, bool)):
+        return str(result)
+    if isinstance(result, list):
+        parts = [_tool_result_text(item) for item in result]
+        return "\n".join(part for part in parts if part).strip()
+    if isinstance(result, dict):
+        cleaned: dict[str, object] = {}
+        for key, value in result.items():
+            key_lower = str(key).lower()
+            if "image" in key_lower and isinstance(value, str) and len(value) > 256:
+                continue
+            cleaned[str(key)] = value
+        try:
+            return json.dumps(cleaned, ensure_ascii=False)
+        except Exception:
+            return str(cleaned)
+    return str(result)
+
+
+def _derive_answer_from_evidence(
+    *,
+    llm_host: str,
+    llm_api_key: str,
+    model_name: str,
+    challenge_description: str,
+    challenge_rules: str,
+    evidence_lines: list[str],
+    agent_id: str,
+    usage_scope: str | None = None,
+) -> str:
+    if not evidence_lines:
+        return ""
+    try:
+        from openai import OpenAI
+    except Exception:
+        return ""
+
+    evidence_block = "\n".join(f"- {line}" for line in evidence_lines if line.strip())
+    if not evidence_block:
+        return ""
+
+    try:
+        client = OpenAI(
+            base_url=llm_host,
+            api_key=llm_api_key,
+            default_headers=build_proxy_headers(agent_id, usage_scope),
+        )
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Use the provided tool evidence to answer the question. "
+                        "Return exactly one final answer line, following the challenge rules."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {challenge_description}\n"
+                        f"Rules: {challenge_rules}\n\n"
+                        f"Tool evidence:\n{evidence_block}\n\n"
+                        "Return only the final answer line."
+                    ),
+                },
+            ],
+            temperature=0.0,
+            max_tokens=256,
+        )
+    except Exception:
+        return ""
+
+    return (response.choices[0].message.content or "").strip()
+
+
+def _derive_answer_from_challenge(
+    *,
+    llm_host: str,
+    llm_api_key: str,
+    model_name: str,
+    challenge_description: str,
+    challenge_rules: str,
+    clues: list[str] | None = None,
+    evidence_lines: list[str] | None = None,
+    agent_id: str,
+    usage_scope: str | None = None,
+) -> str:
+    try:
+        from openai import OpenAI
+    except Exception:
+        return ""
+
+    clue_block = "\n".join(f"- {clue}" for clue in clues or [] if str(clue).strip())
+    if not clue_block:
+        clue_block = "- (No clues provided.)"
+    evidence_block = "\n".join(
+        f"- {line}" for line in evidence_lines or [] if str(line).strip()
+    )
+    if not evidence_block:
+        evidence_block = "- (No required-tool evidence captured.)"
+
+    try:
+        client = OpenAI(
+            base_url=llm_host,
+            api_key=llm_api_key,
+            default_headers=build_proxy_headers(agent_id, usage_scope),
+        )
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Solve the challenge from the provided snapshot. "
+                        "Return exactly one final answer line that follows the rules. "
+                        "Do not include reasoning, markdown, bullets, or wrapper text."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {challenge_description}\n"
+                        f"Rules: {challenge_rules}\n\n"
+                        f"Clues:\n{clue_block}\n\n"
+                        f"Required-tool evidence:\n{evidence_block}\n\n"
+                        "Return only the final answer line."
+                    ),
+                },
+            ],
+            temperature=0.0,
+            max_tokens=256,
+        )
+    except Exception:
+        return ""
+
+    return (response.choices[0].message.content or "").strip()
+
+
+def _extract_session_thought_text(http_client: HttpArenaClient, agent_id: str) -> str:
+    try:
+        session = http_client.get_session(agent_id)
+    except Exception:
+        return ""
+    thoughts = session.get("thoughts") if isinstance(session, dict) else None
+    if not isinstance(thoughts, list):
+        return ""
+    rendered = "\n".join(str(thought) for thought in thoughts if str(thought).strip())
+    return rendered[-6000:]
+
+
+async def _enforce_required_tool_calls(
+    *,
+    mcp_url: str,
+    agent_id: str,
+    challenge_type: str,
+    description: str,
+    rules: str,
+    clues: list[str] | None,
+    available_tool_names: list[str],
+    http_client: HttpArenaClient,
+    extra_context: str = "",
+) -> list[str]:
+    required_runtime_tools = _required_runtime_tools(
+        available_tool_names,
+        challenge_type=challenge_type,
+        description=description,
+        rules=rules,
+        extra_context=extra_context,
+    )
+    if not required_runtime_tools:
+        return []
+
+    query_text = _best_search_query(description, rules, clues, extra_context)
+    evidence_lines: list[str] = []
+    for tool_name in required_runtime_tools:
+        payload_variants = [
+            {"agent_id": agent_id, "query": query_text},
+            {"query": query_text},
+            {"agent_id": agent_id, "search_query": query_text},
+            {"search_query": query_text},
+            {"agent_id": agent_id, "text": query_text},
+            {"text": query_text},
+            {"agent_id": agent_id, "url": query_text},
+            {"url": query_text},
+            {"agent_id": agent_id, "video_url": query_text},
+            {"video_url": query_text},
+            {"agent_id": agent_id},
+            {},
+        ]
+        called = False
+        for payload in payload_variants:
+            try:
+                async with McpArenaClient(mcp_url) as tool_mcp:
+                    result = await tool_mcp.call_tool(tool_name, payload)
+                called = True
+                rendered = _tool_result_text(result)
+                if rendered:
+                    evidence_lines.append(f"{tool_name}: {rendered[:2000]}")
+                break
+            except Exception:
+                continue
+        if called:
+            try:
+                await asyncio.to_thread(
+                    http_client.broadcast_thought,
+                    agent_id,
+                    f"Required tool called before solve: {tool_name}",
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await asyncio.to_thread(
+                    http_client.broadcast_thought,
+                    agent_id,
+                    f"Could not call required tool: {tool_name}",
+                )
+            except Exception:
+                pass
+    return evidence_lines
+
+
 async def main() -> int:
     if not _check_dependencies():
         return 1
@@ -499,7 +1093,7 @@ async def main() -> int:
     mcp_url = get_mcp_url()
     llm_host = get_proxy_host()
     api_key = get_arena_api_key()
-    llm_api_key = get_llm_api_key()
+    llm_api_key = api_key  # LLM proxy expects same key as Agent Gauntlet
     default_ctx = _build_context(challenge_type="text")
     default_llm_params = STRATEGY.get_llm_params(default_ctx)
     text_strategy_notes = str(getattr(STRATEGY, "text_strategy_notes", "") or "").strip()
@@ -526,7 +1120,7 @@ async def main() -> int:
     print(f"   LLM: {llm_host}")
     print()
 
-    # Gauntlet REST client
+    # Agent Gauntlet REST client
     http_client = HttpArenaClient(api_base=api_base, api_key=api_key, timeout=90.0)
 
     print("📝 Registering with Agent Gauntlet...")
@@ -534,16 +1128,19 @@ async def main() -> int:
     print(f"   Session: {session.session_id}")
     print(f"   Status: {session.status}")
     print()
+    session_monitor = monitor_session(http_client, agent_id).start()
     await _wait_for_start_gate(http_client, agent_id)
-    usage_scope = http_client.fetch_usage_scope() or (os.getenv("ARENA_USAGE_SCOPE") or "").strip() or None
+    usage_scope = http_client.fetch_usage_scope() or resolve_usage_scope()
     if usage_scope:
         os.environ["ARENA_USAGE_SCOPE"] = usage_scope
     print()
 
     # Fetch challenge first so model selection is challenge-aware.
     print("🎯 Getting challenge for model selection...")
-    async with McpArenaClient(mcp_url) as arena_mcp:
+    clue_texts: list[str] = []
+    async with McpArenaClient(mcp_url, api_key) as arena_mcp:
         discovered_tool_names = await arena_mcp.list_tools()
+        tool_defs = await arena_mcp.list_tool_defs()
         modality = McpArenaClient.detect_modality(discovered_tool_names)
         while True:
             try:
@@ -559,6 +1156,15 @@ async def main() -> int:
                     await asyncio.sleep(1.0)
                     continue
                 raise
+        if modality == "text":
+            try:
+                clue_texts = await arena_mcp.get_all_clue_texts(agent_id)
+            except McpArenaError:
+                clue_texts = []
+            if not clue_texts:
+                clue_texts = list(getattr(challenge, "clues", []) or [])
+
+    image_tool_proxy_args: dict[str, dict[str, str]] = {}
 
     challenge_rules_for_selection = (
         challenge.rules
@@ -579,21 +1185,22 @@ async def main() -> int:
         image_url=getattr(challenge, "input_image_uri", None),
     )
     ranked_models = STRATEGY.rank_models(selection_ctx, available_models)
-    preferred_model = _resolve_preferred_model(ranked_models)
-    if preferred_model:
-        model_name = preferred_model
-    else:
-        model_name = STRATEGY.pick_model("solve", ranked_models, selection_ctx)
-        if model_name not in available_models:
-            model_name = select_model(
-                challenge_type=challenge.challenge_type,
-                challenge_description=challenge.description,
-                challenge_rules=challenge_rules_for_selection,
-                max_time_s=challenge.max_time_s,
-                available_models=available_models,
-                proxy_host=llm_host,
-                api_key=llm_api_key,
-            )
+    model_name = STRATEGY.pick_model("solve", ranked_models, selection_ctx)
+    model_name = require_explicit_model(
+        model_name,
+        available_models,
+        source="langgraph agent",
+    )
+    image_tool_proxy_args = {
+        tool_name: build_image_tool_arguments(
+            tool_defs,
+            tool_name,
+            selected_model=model_name,
+            llm_api_key=llm_api_key,
+            arena_api_key=api_key,
+        )
+        for tool_name in ("image_edit", "image_generate", "image_analyze")
+    }
     text_system_prompt = (
         STRATEGY.build_system_prompt(selection_ctx).strip() or DEFAULT_TEXT_SYSTEM_PROMPT
     )
@@ -615,21 +1222,32 @@ async def main() -> int:
 
     # Connect to MCP server and get tools
     print("🔧 Connecting to MCP server...")
-    mcp_sse_url = f"{mcp_url}/sse"
-    if api_key:
-        mcp_sse_url = f"{mcp_sse_url}?api_key={quote(api_key, safe='')}"
     mcp_client = MultiServerMCPClient(
         {
-            "arena": {
-                "url": mcp_sse_url,
-                "transport": "sse",
-            }
+            "arena": _build_mcp_sse_connection(mcp_url, api_key)
         }
     )
-    tools = await mcp_client.get_tools()
+    tools = [
+        _wrap_tool_with_extra_args(tool, image_tool_proxy_args.get(getattr(tool, "name", ""), {}))
+        for tool in await mcp_client.get_tools()
+    ]
     tool_names = [t.name for t in tools]
     print(f"   Tools discovered: {tool_names}")
     print()
+
+    required_tool_evidence_lines: list[str] = []
+    if modality == "text":
+        required_tool_evidence_lines = await _enforce_required_tool_calls(
+            mcp_url=mcp_url,
+            agent_id=agent_id,
+            challenge_type=str(challenge.challenge_type or ""),
+            description=str(challenge.description or ""),
+            rules=str(challenge.rules or ""),
+            clues=clue_texts,
+            available_tool_names=tool_names,
+            http_client=http_client,
+            extra_context=str(getattr(challenge, "extra_text", "") or ""),
+        )
 
     # Solve the puzzle
     print("🧠 Solving with ReAct agent...")
@@ -681,17 +1299,37 @@ async def main() -> int:
                 f"{text_strategy_notes}\n\n"
             )
         clue_preview = "\n".join(
-            f"- {clue}" for clue in (challenge.clues or []) if isinstance(clue, str) and clue.strip()
+            f"- {clue}" for clue in clue_texts if isinstance(clue, str) and clue.strip()
         )
         if not clue_preview:
             clue_preview = "- (No clues provided.)"
         challenge_type = (challenge.challenge_type or "").lower()
-        rules_lower = (challenge.rules or "").lower()
+        challenge_text_lower = " ".join(
+            [
+                str(challenge.challenge_type or ""),
+                str(challenge.description or ""),
+                str(challenge.rules or ""),
+            ]
+        ).lower()
         required_tool_hint = ""
-        if challenge_type in {"web-search", "market-research"} or "firecrawl_search" in rules_lower:
-            required_tool_hint = (
-                "- You MUST call firecrawl_search at least once before your final answer.\n"
+        mandatory_tools: list[str] = []
+        for tool_name in tool_names:
+            normalized = str(tool_name or "").strip()
+            if not normalized:
+                continue
+            if normalized.lower() in challenge_text_lower and normalized not in mandatory_tools:
+                mandatory_tools.append(normalized)
+        if challenge_type in {"web-search", "market-research"}:
+            for tool_name in tool_names:
+                normalized = str(tool_name or "").strip()
+                if "search" in normalized.lower() and normalized not in mandatory_tools:
+                    mandatory_tools.append(normalized)
+        for tool_name in mandatory_tools:
+            required_tool_hint += (
+                f"- MANDATORY: If `{tool_name}` is available, call it at least once "
+                "before your final answer.\n"
             )
+        output_instruction = _build_output_instruction(challenge.rules or "")
         prompt = (
             f"{text_strategy_block}"
             f"You are competing in a timed challenge.\n\n"
@@ -703,10 +1341,10 @@ async def main() -> int:
             f"Execution requirements:\n"
             f"{required_tool_hint}"
             f"- Use available tools as needed before finalizing.\n"
-            f"- Keep reasoning EXTREMELY short (3 sentences max)\n"
-            f"- After solving, output the answer on its own line as: ANSWER: <your answer>\n"
-            f"- If Rules require strict one-line output, follow it exactly.\n"
-            f"- The ANSWER line is MANDATORY. Without it, you score zero.\n"
+            f"- Be terse: do not restate clues, do not narrate steps.\n"
+            f"- Do not output reasoning unless rules explicitly require it.\n"
+            f"- If reasoning is unavoidable, keep it to 1 short sentence max.\n"
+            f"- {output_instruction}\n"
         )
 
     default_recursion_limit = 8 if modality == "image" else 12
@@ -729,16 +1367,7 @@ async def main() -> int:
         f"   ReAct limits: recursion={react_recursion_limit}, timeout={react_timeout_s:.1f}s"
     )
 
-    candidate_models: list[str] = []
-    for candidate in [model_name, *ranked_models, *available_models]:
-        normalized = str(candidate or "").strip()
-        if normalized and normalized not in candidate_models:
-            candidate_models.append(normalized)
-    max_attempts = min(
-        len(candidate_models),
-        _coerce_positive_int(os.getenv("SOLVE_MAX_ATTEMPTS"), 3),
-    )
-    candidate_models = candidate_models[:max_attempts]
+    candidate_models = [model_name]
 
     live_prompt_tokens = 0
     live_completion_tokens = 0
@@ -819,7 +1448,7 @@ async def main() -> int:
             api_key=llm_api_key,
             temperature=text_temperature,
             max_tokens=text_max_tokens,
-            default_headers=_build_proxy_headers(agent_id, usage_scope),
+            default_headers=build_proxy_headers(agent_id, usage_scope),
         )
         agent = create_react_agent(llm, tools)
         try:
@@ -868,11 +1497,25 @@ async def main() -> int:
     total_time_ms = int(time.time() * 1000 - start_ms)
 
     raw_content = ""
+    retry_source = ""
     react_image_uri = ""
     react_image_model_name = ""
     react_used_image_tool = False
     if result is not None:
-        raw_content = _extract_latest_message_text(result.get("messages"))
+        messages = result.get("messages")
+        raw_content = _extract_latest_message_text(messages)
+        retry_source = _extract_transcript_text(messages)
+        if not raw_content and retry_source:
+            raw_content = retry_source
+        if not raw_content and modality == "text":
+            session_thought_text = await asyncio.to_thread(
+                _extract_session_thought_text,
+                http_client,
+                agent_id,
+            )
+            if session_thought_text:
+                raw_content = session_thought_text
+                retry_source = session_thought_text
         if modality == "image":
             react_image_uri, react_image_model_name, react_used_image_tool = _extract_react_image_output(
                 result.get("messages")
@@ -982,6 +1625,7 @@ async def main() -> int:
                                 "image_uri": image_challenge.input_image_uri,
                                 "prompt": fallback_prompt,
                                 "agent_id": agent_id,
+                                **image_tool_proxy_args.get("image_edit", {}),
                             },
                         )
                         image_uri = _extract_image_uri_from_tool_result(edit_result)
@@ -992,7 +1636,11 @@ async def main() -> int:
                     if not image_uri and planned_tool == "image_generate" and "image_generate" in tool_names:
                         generate_result = await fallback_mcp.call_tool(
                             "image_generate",
-                            {"prompt": fallback_prompt, "agent_id": agent_id},
+                            {
+                                "prompt": fallback_prompt,
+                                "agent_id": agent_id,
+                                **image_tool_proxy_args.get("image_generate", {}),
+                            },
                         )
                         image_uri = _extract_image_uri_from_tool_result(generate_result)
                         if isinstance(generate_result, dict):
@@ -1006,6 +1654,7 @@ async def main() -> int:
                                 "image_uri": image_challenge.input_image_uri,
                                 "prompt": fallback_prompt,
                                 "agent_id": agent_id,
+                                **image_tool_proxy_args.get("image_edit", {}),
                             },
                         )
                         image_uri = _extract_image_uri_from_tool_result(edit_result)
@@ -1016,7 +1665,11 @@ async def main() -> int:
                     if not image_uri and "image_generate" in tool_names:
                         generate_result = await fallback_mcp.call_tool(
                             "image_generate",
-                            {"prompt": fallback_prompt, "agent_id": agent_id},
+                            {
+                                "prompt": fallback_prompt,
+                                "agent_id": agent_id,
+                                **image_tool_proxy_args.get("image_generate", {}),
+                            },
                         )
                         image_uri = _extract_image_uri_from_tool_result(generate_result)
                         if isinstance(generate_result, dict):
@@ -1066,40 +1719,110 @@ async def main() -> int:
             except Exception:
                 pass
         print("\n✅ Agent completed!")
+        await session_monitor.stop()
         return 0
 
-    # Extract the answer from the latest non-empty text returned by LangGraph.
-    answer = extract_answer(raw_content)
+    evidence_answer = ""
+    if modality == "text" and required_tool_evidence_lines:
+        raw_evidence_answer = _derive_answer_from_evidence(
+            llm_host=llm_host,
+            llm_api_key=llm_api_key,
+            model_name=model_name,
+            challenge_description=str(challenge.description or ""),
+            challenge_rules=str(challenge.rules or ""),
+            evidence_lines=required_tool_evidence_lines,
+            agent_id=agent_id,
+            usage_scope=usage_scope,
+        )
+        evidence_answer = extract_answer(raw_evidence_answer, challenge.rules or "")
+        if evidence_answer:
+            try:
+                await asyncio.to_thread(
+                    http_client.broadcast_thought,
+                    agent_id,
+                    f"Derived answer from required tool evidence: {evidence_answer}",
+                )
+            except Exception:
+                pass
+        if _is_invalid_answer_candidate(evidence_answer):
+            evidence_answer = ""
 
-    if not answer and raw_content:
+    # Extract the answer from the latest non-empty text returned by LangGraph.
+    answer = extract_answer(raw_content, challenge.rules or "")
+    if _is_invalid_answer_candidate(answer):
+        answer = ""
+    if not answer and evidence_answer:
+        answer = evidence_answer
+
+    formatter_input = raw_content or retry_source
+    if not answer and formatter_input:
         # First retry: re-prompt with strict instructions if initial extraction fails
         print("   Extraction failed; retrying with strict formatter...")
-        strict_system_msg = "You are a strict answer extractor. Extract the final answer from the provided reasoning and return it in exactly one line: ANSWER: <final answer>. No preamble, no tags, no explanation, no thinking blocks, no additional lines. If the reasoning is incomplete, make your best guess for the ordering of events and return it in the ANSWER format. DO NOT USE <think> TAGS. OUTPUT ONLY THE ANSWER LINE."
+        strict_system_msg = (
+            "You are a strict final-answer formatter. "
+            "Return exactly one final answer line that follows the provided challenge rules. "
+            "Do not include reasoning, tags, JSON, markdown, or bullets. "
+            "If uncertain, still provide the best single-line answer."
+        )
         try:
             from openai import OpenAI
-
             client = OpenAI(
                 base_url=llm_host,
                 api_key=llm_api_key,
-                default_headers=_build_proxy_headers(agent_id, usage_scope),
+                default_headers=build_proxy_headers(agent_id, usage_scope),
             )
             strict_response = client.chat.completions.create(
-                model="nemotron-nano-9b",
+                model="nemotron-3-nano-30b",
                 messages=[
                     {"role": "system", "content": strict_system_msg},
-                    {"role": "user", "content": f"Reasoning:\n\n{raw_content}\n\nExtract the final answer now."},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Challenge rules:\n{challenge.rules or ''}\n\n"
+                            f"Model output:\n{formatter_input}\n\n"
+                            "Return the final answer now as exactly one line."
+                        ),
+                    },
                 ],
                 max_tokens=256,
                 temperature=0.0,
             )
             raw_retry = strict_response.choices[0].message.content or ""
             print(f"   Retry output: {raw_retry.strip()}")
-            answer = extract_answer(raw_retry)
+            answer = extract_answer(raw_retry, challenge.rules or "")
+            if _is_invalid_answer_candidate(answer):
+                answer = ""
         except Exception as e:
             print(f"   Retry failed: {e}")
             pass
 
-    if not answer and solve_error:
+    if not answer and modality == "text":
+        print("   No ReAct answer extracted; running direct final-answer fallback...")
+        raw_direct_answer = _derive_answer_from_challenge(
+            llm_host=llm_host,
+            llm_api_key=llm_api_key,
+            model_name=model_name,
+            challenge_description=str(challenge.description or ""),
+            challenge_rules=str(challenge.rules or ""),
+            clues=clue_texts,
+            evidence_lines=required_tool_evidence_lines,
+            agent_id=agent_id,
+            usage_scope=usage_scope,
+        )
+        answer = extract_answer(raw_direct_answer, challenge.rules or "")
+        if _is_invalid_answer_candidate(answer):
+            answer = ""
+        if answer:
+            try:
+                await asyncio.to_thread(
+                    http_client.broadcast_thought,
+                    agent_id,
+                    f"Direct fallback answer: {answer}",
+                )
+            except Exception:
+                pass
+
+    if not answer:
         answer = _extract_ordered_answer_from_rules(challenge.rules or "")
         if answer:
             await asyncio.to_thread(
@@ -1107,13 +1830,55 @@ async def main() -> int:
                 agent_id,
                 f"✅ Using fallback answer from challenge rules: {answer}",
             )
-        else:
-            answer = "unknown"
-            await asyncio.to_thread(
-                http_client.broadcast_thought,
-                agent_id,
-                "⚠️ No fallback answer pattern found; submitting 'unknown'.",
+
+    # For strict one-line schema tasks, validate and run one repair pass before submit.
+    needs_schema = _requires_single_line_answer(challenge.rules or "")
+    if answer and needs_schema:
+        normalized = _normalize_tuple_payload(answer)
+        if normalized:
+            answer = normalized
+        if not _is_schema_compliant_answer(answer, challenge.rules or ""):
+            print("   Answer schema check failed; repairing with formatter...")
+            repair_system_msg = (
+                "You are a strict output repair assistant. "
+                "Return exactly one line that satisfies the challenge format rules. "
+                "Do not include reasoning or extra text."
             )
+            try:
+                from openai import OpenAI
+
+                repair_client = OpenAI(
+                    base_url=llm_host,
+                    api_key=llm_api_key,
+                    default_headers=build_proxy_headers(agent_id, usage_scope),
+                )
+                repair_response = repair_client.chat.completions.create(
+                    model="nemotron-3-nano-30b",
+                    messages=[
+                        {"role": "system", "content": repair_system_msg},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Challenge rules:\n{challenge.rules or ''}\n\n"
+                                f"Current answer:\n{answer}\n\n"
+                                f"Raw model output:\n{formatter_input}\n\n"
+                                "Repair and return one valid final line now."
+                            ),
+                        },
+                    ],
+                    max_tokens=256,
+                    temperature=0.0,
+                )
+                repaired_raw = repair_response.choices[0].message.content or ""
+                repaired_answer = extract_answer(repaired_raw, challenge.rules or "")
+                repaired_answer = _normalize_tuple_payload(repaired_answer)
+                if repaired_answer and not _is_invalid_answer_candidate(repaired_answer):
+                    answer = repaired_answer
+            except Exception as exc:
+                print(f"   Repair pass failed: {exc}")
+
+    if _is_invalid_answer_candidate(answer):
+        answer = ""
     try:
         async with McpArenaClient(mcp_url) as timing_mcp:
             time_info = await timing_mcp.time_remaining(agent_id)
@@ -1136,8 +1901,15 @@ async def main() -> int:
 
     # Submit
     if not answer:
-        print("⚠️ No valid answer found; skipping submission.")
-        return 1
+        answer = "unknown"
+        print("⚠️ No valid answer found; submitting fallback 'unknown'.")
+        try:
+            http_client.broadcast_thought(
+                agent_id,
+                "⚠️ No valid answer extracted; submitting fallback answer 'unknown'.",
+            )
+        except Exception as exc:
+            print(f"   broadcast skipped ({exc})")
 
     print(f"📤 Submitting answer: {answer}")
     try:
@@ -1181,8 +1953,15 @@ async def main() -> int:
         print("   ⚠️ Submit failed after retries")
 
     print("\n✅ Agent completed!")
+    await session_monitor.stop()
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    try:
+        raise SystemExit(asyncio.run(main()))
+    except asyncio.CancelledError:
+        raise SystemExit(0)
+    except ModelSelectionError as exc:
+        print(f"   {exc}")
+        raise SystemExit(1)

@@ -1,12 +1,17 @@
-"""HTTP client for Arena REST API coordination.
+"""HTTP client for Agent Gauntlet Platform REST API coordination.
 
 This client handles session management, thought broadcasting, and submission
 via the REST API. It's framework-agnostic and can be used from any agent.
 
+The API base URL is derived from `ARENA_SERVER` by default, and the competitor
+key is sent as the `X-Arena-API-Key` header.
+
 Example:
+    client = HttpArenaClient()  # reads ARENA_SERVER and ARENA_API_KEY
+    # or, explicitly:
     client = HttpArenaClient(
-        api_base="http://server:8000",
-        api_key="team1-key",
+        api_base="https://arena.example.com",
+        api_key="<battle-key>",
     )
 
     # Register session
@@ -21,11 +26,13 @@ Example:
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
+import json
+import os
+import time
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+
+import requests
 
 from .config import get_api_base, get_arena_api_key
 
@@ -53,10 +60,10 @@ class SubmitResult:
 
 
 class HttpArenaClient:
-    """HTTP client for Arena REST API coordination.
+    """HTTP client for Agent Gauntlet Platform REST API coordination.
 
-    This client is intentionally simple and dependency-free (uses only stdlib)
-    to work with any Python framework or agent implementation.
+    This client uses requests for predictable POST behavior across local and
+    remote rehearsal machines.
     """
 
     def __init__(
@@ -68,7 +75,7 @@ class HttpArenaClient:
         """Initialize the client.
 
         Args:
-            api_base: Base URL for the Arena API (default: ARENA_API_BASE or
+            api_base: Base URL for the Agent Gauntlet Platform API (default: ARENA_API_BASE or
                 derived from ARENA_SERVER)
             api_key: API key for authentication (default: ARENA_API_KEY env var)
             timeout: Request timeout in seconds
@@ -91,17 +98,18 @@ class HttpArenaClient:
         if self.api_key:
             headers["X-Arena-API-Key"] = self.api_key
 
-        body = json.dumps(data).encode("utf-8") if data else None
-
-        request = Request(url, data=body, headers=headers, method=method)
-
         try:
-            with urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as e:
-            error_body = e.read().decode("utf-8")
-            raise ArenaAPIError(e.code, error_body) from e
-        except URLError as e:
+            response = requests.request(
+                method,
+                url,
+                headers=headers,
+                json=data if data is not None else None,
+                timeout=self.timeout,
+            )
+            if response.status_code >= 400:
+                raise ArenaAPIError(response.status_code, response.text)
+            return response.json()
+        except requests.RequestException as e:
             raise ArenaConnectionError(str(e)) from e
 
     def health(self) -> dict[str, Any]:
@@ -126,15 +134,36 @@ class HttpArenaClient:
         if agent_name:
             data["agent_name"] = agent_name
 
-        import time
+        raw_timeout_s = os.getenv("ARENA_REGISTRATION_TIMEOUT_S", "600")
+        try:
+            timeout_s = float(raw_timeout_s)
+        except ValueError:
+            timeout_s = 600.0
+        if timeout_s <= 0:
+            timeout_s = 600.0
+        deadline = time.monotonic() + timeout_s
+        delay_s = 1.0
         while True:
             try:
                 result = self._request("POST", "/api/session/register", data)
                 break
             except ArenaAPIError as e:
                 if e.status_code == 409:
+                    if e.code == "registration_too_late":
+                        raise ArenaConnectionError(
+                            "Registration is closed for the current round. "
+                            "Register during the next lobby."
+                        ) from e
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0:
+                        timeout_label = f"{timeout_s:g}"
+                        raise ArenaConnectionError(
+                            "Registration did not open within "
+                            f"{timeout_label} seconds."
+                        ) from e
                     print("   Lobby is not open yet. Waiting for organizer...", flush=True)
-                    time.sleep(2.0)
+                    time.sleep(min(delay_s, remaining_s))
+                    delay_s = min(delay_s * 2.0, 10.0)
                 else:
                     raise
 
@@ -152,7 +181,7 @@ class HttpArenaClient:
         status: str,
         client_metrics: dict[str, Any] | None = None,
     ) -> bool:
-        """Update agent status shown in the arena.
+        """Update agent status shown in Agent Gauntlet.
 
         Args:
             agent_id: The agent's ID
@@ -170,7 +199,7 @@ class HttpArenaClient:
         return result.get("updated", False)
 
     def broadcast_thought(self, agent_id: str, thought: str) -> bool:
-        """Broadcast a thought to the arena.
+        """Broadcast a thought to Agent Gauntlet.
 
         Args:
             agent_id: The agent's ID
@@ -217,7 +246,7 @@ class HttpArenaClient:
         agent_id: str,
         answer: str,
         client_metrics: dict[str, Any] | None = None,
-        challenge_type: str = "text",
+        challenge_type: str | None = "text",
     ) -> SubmitResult:
         """Submit a final answer.
 
@@ -225,20 +254,23 @@ class HttpArenaClient:
             agent_id: The agent's ID
             answer: The final answer
             client_metrics: Optional metrics (model_name, tokens, etc.)
-            challenge_type: "text" or "image"
+            challenge_type: "text" or "image". ``None`` omits the field so
+                the server uses its authoritative assignment.
 
         Returns:
             SubmitResult with score and status
         """
+        payload: dict[str, Any] = {
+            "agent_id": agent_id,
+            "answer": answer,
+            "client_metrics": client_metrics or {},
+        }
+        if challenge_type is not None:
+            payload["challenge_type"] = challenge_type
         result = self._request(
             "POST",
             "/api/submit",
-            {
-                "agent_id": agent_id,
-                "answer": answer,
-                "client_metrics": client_metrics or {},
-                "challenge_type": challenge_type,
-            },
+            payload,
         )
 
         return SubmitResult(
@@ -273,7 +305,7 @@ class HttpArenaClient:
         return self._request("GET", "/api/competition")
 
     def fetch_usage_scope(self) -> str | None:
-        """Fetch and cache the active round usage scope when available."""
+        """Fetch and cache the active battle usage scope when available."""
         if self._usage_scope_cache:
             return self._usage_scope_cache
         try:
@@ -288,15 +320,28 @@ class HttpArenaClient:
 
 
 class ArenaAPIError(Exception):
-    """Error from the Arena API."""
+    """Error from the Agent Gauntlet Platform API."""
 
     def __init__(self, status_code: int, message: str):
+        code: str | None = None
+        try:
+            payload = json.loads(message)
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            detail = payload.get("detail")
+            if isinstance(detail, dict):
+                raw_code = detail.get("code")
+                if isinstance(raw_code, str) and raw_code.strip():
+                    code = raw_code.strip()
+
         self.status_code = status_code
         self.message = message
+        self.code = code
         super().__init__(f"API error {status_code}: {message}")
 
 
 class ArenaConnectionError(Exception):
-    """Connection error to the Arena API."""
+    """Connection error to the Agent Gauntlet Platform API."""
 
     pass
