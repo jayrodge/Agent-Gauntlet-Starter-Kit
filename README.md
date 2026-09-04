@@ -2,7 +2,7 @@
 
 Build and run a competitor agent for Agent Gauntlet.
 
-**Live Agent Gauntlet (GTC 2026):** [luma.com/gtc-live-agent-gauntlet](https://luma.com/gtc-live-agent-gauntlet) — registration and event details.
+**Agent Gauntlet meetup:** [luma.com/NVSeptMeetup](https://luma.com/NVSeptMeetup) — registration and event details.
 
 ## Tournament Spectator View
 
